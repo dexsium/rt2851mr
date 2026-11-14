@@ -1,0 +1,38 @@
+name: nova-media-build
+
+# Реальная сборка userspace-компонентов Nova (nova-vdec, nova-rtk-rpc,
+# nova-decoder-diagnostics) кросс-тулчейном ARM32 — той же архитектурой,
+# что у реального устройства. Это ПРОВЕРКА КОМПИЛЯЦИИ заголовков/ABI,
+# написанных на основе rtk_vdec.h и rpcapi.h, НЕ сборка или прошивка ядра.
+# Ничего не устанавливается на устройство.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Build nova-vdec / nova-rtk-rpc / nova-decoder-diagnostics
+        run: |
+          cd nova-media
+          make CROSS_COMPILE=arm-linux-gnueabihf-
+
+      - name: Verify ARM binary
+        run: |
+          cd nova-media
+          file nova_vdec_diag
+          arm-linux-gnueabihf-readelf -h nova_vdec_diag | grep -i "Machine\|Class"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-media-build-${{ github.run_id }}
+          path: nova-media/nova_vdec_diag
+          retention-days: 14
