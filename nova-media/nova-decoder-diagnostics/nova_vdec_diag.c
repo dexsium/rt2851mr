@@ -20,18 +20,47 @@
  * собственного загружаемого ядра с этим драйвером, которого на этом ТВ
  * запустить невозможно (locked bootloader, см. отчёт о bootstrap).
  */
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../nova-vdec/nova_vdec.h"
+#include "../nova-rtk-rpc/nova_rpc.h"
+
+/* Проверка доступности device-ноды без попытки её открыть/изменить —
+ * безопасна даже на стоковом Android-ядре (просто access(2)). */
+static void check_node(const char *path)
+{
+    if (access(path, F_OK) == 0)
+        printf("[node] %-20s существует\n", path);
+    else
+        printf("[node] %-20s отсутствует (%s)\n", path, strerror(errno));
+}
 
 int main(void)
 {
     nova_vdec_handle_t h;
+    nova_rpc_handle_t rpc;
     nova_vdec_frameinfo_t info;
     int ret;
 
-    ret = nova_vdec_init(&h);
+    printf("=== Проверка device-нод (read-only, access(2)) ===\n");
+    check_node(NOVA_VDEC_DEVICE_NODE);
+    check_node(NOVA_RPC_DEVICE_NODE);
+    check_node("/dev/rpc0");
+    check_node("/dev/rpcdebug");
+
+    printf("\n=== RPC control-узел ===\n");
+    ret = nova_rpc_open(&rpc);
+    if (ret == 0) {
+        printf("nova_rpc_open: ok (fd открыт)\n");
+        nova_rpc_close(&rpc);
+    } else {
+        printf("nova_rpc_open: failed %d (%s)\n", ret, strerror(-ret));
+    }
+
+    printf("\n=== VDEC ===\n");
     if (ret != 0) {
         fprintf(stderr, "nova_vdec_init(%s) failed: %d (%s)\n",
                 NOVA_VDEC_DEVICE_NODE, ret, strerror(-ret));
