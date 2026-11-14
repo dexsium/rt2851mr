@@ -12,10 +12,6 @@
 #define NOVA_RPC_IOCTHANDLER  _IO(NOVA_RPC_IOC_MAGIC, 3)
 #define NOVA_RPC_IOSTOP       _IO(NOVA_RPC_IOC_MAGIC, 4)
 
-/* Control-узел, который сам создаёт драйвер ядра (RPCDriver.c:648,
- * device_create(..., MKDEV(rpc_major, 100), ..., "rpc100")). */
-#define NOVA_RPC_DEVICE_NODE "/dev/rpc100"
-
 int nova_rpc_open(nova_rpc_handle_t *out)
 {
     if (!out)
