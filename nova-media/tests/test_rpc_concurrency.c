@@ -18,11 +18,40 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * Аппаратный предохранитель от зависания (найден реально, не гипотетически:
+ * на CI run 43635651464 этот тест/соседний job провисел в "in progress"
+ * более двух часов до принудительной отмены — точная причина не
+ * локализована построчно в этой сессии при статическом анализе, см.
+ * честную запись в итоговом отчёте). SIGALRM гарантированно завершает
+ * процесс ненулевым кодом вместо бесконечного/многочасового зависания —
+ * превращает скрытый deadlock в быстрый, явный провал теста, а не в
+ * растраченные часы CI. Не маскирует проблему успешным выходом.
+ */
+static void watchdog_handler(int sig)
+{
+    (void)sig;
+    const char msg[] = "\nFAIL watchdog: test exceeded 60s wall-clock budget, aborting (likely deadlock, see NOVA_RPC_REPLY_PATH_AUDIT.md)\n";
+    write(2, msg, sizeof(msg) - 1);
+    _exit(97);
+}
+
+static void install_watchdog(unsigned seconds)
+{
+    struct sigaction sa;
+    sa.sa_handler = watchdog_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(seconds);
+}
 
 #include "../nova-rtk-rpc/nova_rpc_protocol.h"
 #include "../nova-rtk-rpc/nova_rpc_transport.h"
@@ -208,6 +237,7 @@ int main(void)
     int ret;
     int server_wfd, server_rfd;
 
+    install_watchdog(60);
     srand(12345); /* детерминированный seed — тест воспроизводим */
 
     snprintf(dir, sizeof(dir), "/tmp/nova_rpc_conc_%d", (int)getpid());
