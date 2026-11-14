@@ -70,8 +70,15 @@ test_vo_rpc: tests/test_vo_rpc.c nova_vo_rpc.o nova_rpc_transport.o nova_rpc_xdr
 test_rpc_e2e: tests/test_rpc_e2e.c nova_rpc_transport.o nova_rpc_xdr.o
 	$(CC) $(CFLAGS) -o test_rpc_e2e tests/test_rpc_e2e.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
+test_rpc_concurrency: tests/test_rpc_concurrency.c nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_rpc_concurrency tests/test_rpc_concurrency.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
+
+test_rpc_lifecycle: tests/test_rpc_lifecycle.c nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_rpc_lifecycle tests/test_rpc_lifecycle.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
+
 MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
-             test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e
+             test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e \
+             test_rpc_concurrency test_rpc_lifecycle
 
 mock-tests: $(MOCK_TESTS)
 
