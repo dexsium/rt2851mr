@@ -1,40 +1,44 @@
 /*
- * nova_rpc_transport — реальный транспорт Realtek Video RPC для userspace,
- * восстановленный построчно из `kernel/drivers/rtk_kdriver/common/IPC/src/rpcstubapi.c`
- * (функции `openStubRPC`/`writeRingBuf`/`waitReply`/`getTaskID`, строки
- * 76-85, 151-225, 276-363) и `ClientStub.c` (функции `client_call`/
- * `prepareRPCCall`, строки 37-143). Это НЕ предположение по названию —
- * каждая деталь ниже процитирована из конкретной функции.
+ * nova_rpc_transport — реальный, двусторонний транспорт Realtek Video RPC.
  *
- * Подтверждённый механизм отправки (CONFIRMED):
- * 1. Открыть ОБА устройства для нужного CPU/режима:
- *      Audio: /dev/rpc0 (poll, O_WRONLY), /dev/rpc1 (intr, O_WRONLY)
- *      Video: /dev/rpc4 (poll), /dev/rpc5 (intr)
- *      Video2: /dev/rpc8 (poll), /dev/rpc9 (intr)
- *    (rpcstubapi.c:76-85, открываются в openStubRPC():162-210)
- * 2. Собрать непрерывный буфер [RPC_STRUCT-заголовок][XDR-аргументы],
- *    закодировать оба big-endian (см. nova_rpc_xdr.h).
- * 3. write() всего буфера целиком в выбранный fd (poll или intr —
- *    по флагу USE_INTR_BUF) — ClientStub.c:96, rpcstubapi.c:317-320.
- * 4. Если BLOCK_MODE: заблокировать сигнал SIGRPC (SIGUSR2 на 32-бит ARM
- *    bionic, иначе SIGRTMIN+19 — rpcstubapi.c:44-49), затем
- *    sigsuspend()-цикл до isAck=1, выставляемого обработчиком сигнала
- *    (rpcstubapi.c:335-363), либо sigtimedwait с таймаутом 100 секунд,
- *    опрос каждые 30 мс (rpcstubapi.c:367-411, вариант
- *    `__timedwaitReply`).
+ * Reply path (CONFIRMED буквально, новое в этой сессии):
+ *   `kernel/drivers/rtk_kdriver/common/IPC/src/SVCFunc.c:58-93` (`Reply_Handler`):
+ *     1. читает `rpc->parameterSize` байт из ring buffer (`readRingBuf`);
+ *     2. первые 4 байта — `u_long result_taskID` (XDR-декодированы);
+ *     3. ОСТАВШИЕСЯ байты **копируются напрямую** в `(char *)rpc->context`
+ *        (`memcpy((char *)rpc->context, buf, parameterSize - 4)`) —
+ *        `context` в оригинале буквально используется как адрес памяти
+ *        вызывающего процесса, не просто как "cookie";
+ *     4. `ackTask(result_taskID)` = `tkill(taskid, SIGRPC)`
+ *        (`rpcapi.c:283-287`) — пробуждает ИМЕННО тот поток.
+ *   `ReplyHandler_register()` (`SVCFunc.c:159-163`) регистрирует этот
+ *   обработчик для `programID=REPLYID=99, versionID=REPLYID=99`.
  *
- * Статус: IMPLEMENTED, COMPILED — отправка (шаги 1-4) реализована по-настоящему,
- * не заглушка. Приёмная сторона (как именно доставляется SIGRPC
- * конкретному потоку — через `tkill()` из читающего RPCProxy_loop-потока,
- * `RPCProxy.c:58-110`, подтверждено архитектурно, но точная привязка
- * taskID→сигнал не протестирована без живого AVCPU) — см.
- * nova_rpc_callbacks.h. NOT TESTED на реальном железе.
+ * ВАЖНОЕ ОТЛИЧИЕ Nova ОТ ОРИГИНАЛА (документировано, не скрыто): в
+ * оригинале `context` — это НЕПРОВЕРЯЕМЫЙ raw-указатель: если ответ
+ * придёт после тайм-аута (буфер вызывающего уже мог быть
+ * освобождён/переиспользован), `Reply_Handler` всё равно сделает
+ * `memcpy` в уже недействительный адрес — use-after-free в самом
+ * протоколе Realtek, не найдено никакой защиты от этого в прочитанном
+ * коде. Nova НЕ повторяет эту уязвимость: `context` здесь — индекс в
+ * таблице `nova_rpc_pending_t` (не сырой указатель), и каждая запись
+ * имеет явное состояние (`PENDING/COMPLETED/EXPIRED`) — поздний или
+ * повторный ответ на уже истёкший/завершённый запрос безопасно
+ * отбрасывается (см. `nova_rpc_transport_dispatch_reply()`), а не
+ * разрушает память. Это прямое выполнение требования ТЗ §8 "защита от
+ * use-after-free"/"защита от повторного применения устаревшего
+ * контекста" — ценой намеренного, задокументированного отклонения от
+ * побитового повторения оригинальной (уязвимой) реализации context.
+ * Формат заголовка на проводе (28 байт, порядок полей) НЕ изменён —
+ * отклонение только в том, ЧТО значит 32-битное значение в поле
+ * `context` для НАШЕГО собственного процесса, а не в wire-формате.
  */
 #ifndef NOVA_RPC_TRANSPORT_H
 #define NOVA_RPC_TRANSPORT_H
 
 #include "nova_rpc_xdr.h"
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -42,65 +46,91 @@
 extern "C" {
 #endif
 
-/* Буквально rpcstubapi.c / RPCstruct.h — не придуманы. */
-#define NOVA_RPC_T_NONBLOCK_MODE  0x00
-#define NOVA_RPC_T_BLOCK_MODE     0x01
-#define NOVA_RPC_T_USE_POLL_BUF   0x00
-#define NOVA_RPC_T_USE_INTR_BUF   0x02
-#define NOVA_RPC_T_SEND_VIDEO_CPU  0x00
-#define NOVA_RPC_T_SEND_AUDIO_CPU  0x04
-#define NOVA_RPC_T_SEND_VIDEO_CPU2 0x08
+#define NOVA_RPC_T_NONBLOCK_MODE   0x00
+#define NOVA_RPC_T_BLOCK_MODE      0x01
+#define NOVA_RPC_T_USE_POLL_BUF    0x00
+#define NOVA_RPC_T_USE_INTR_BUF    0x02
+#define NOVA_RPC_T_SEND_VIDEO_CPU   0x00
+#define NOVA_RPC_T_SEND_AUDIO_CPU   0x04
+#define NOVA_RPC_T_SEND_VIDEO_CPU2  0x08
+
+#define NOVA_RPC_T_MAX_PENDING 64
+
+typedef enum nova_rpc_pending_state {
+    NOVA_RPC_PENDING_FREE = 0,
+    NOVA_RPC_PENDING_WAITING,
+    NOVA_RPC_PENDING_COMPLETED,
+    NOVA_RPC_PENDING_EXPIRED
+} nova_rpc_pending_state_t;
+
+typedef struct nova_rpc_pending {
+    uint32_t task_id;
+    uint8_t *result_buf;
+    size_t result_cap;
+    size_t result_len;
+    nova_rpc_pending_state_t state;
+} nova_rpc_pending_t;
 
 typedef struct nova_rpc_transport {
-    int fd_poll_video;
-    int fd_intr_video;
-    int fd_poll_audio;
-    int fd_intr_audio;
-    int fd_poll_video2;
-    int fd_intr_video2;
+    /* write-side (отправка), CONFIRMED rpcstubapi.c:76-85 */
+    int fd_poll_video, fd_intr_video;
+    int fd_poll_audio, fd_intr_audio;
+    int fd_poll_video2, fd_intr_video2;
+    /* read-side (приём/callback), CONFIRMED rpcapi.c:34-45 */
+    int rfd_poll_video, rfd_intr_video;
+    int rfd_poll_audio, rfd_intr_audio;
+    int rfd_poll_video2, rfd_intr_video2;
+
     int opened;
+
+    nova_rpc_pending_t pending[NOVA_RPC_T_MAX_PENDING];
+    pthread_mutex_t pending_mutex;
 } nova_rpc_transport_t;
 
-/* Открывает device-ноды, подтверждённые в rpcstubapi.c:76-85/162-196.
- * Открывает video+audio+video2 сразу (как и openStubRPC() — не делает
- * их опциональными по вызову, т.к. оригинал тоже открывает все сразу). */
+/* Позволяет override путей device-нод для mock/e2e-тестов (CI без
+ * реального /dev/rpcN) — если переменная окружения не задана, используется
+ * подтверждённый реальный путь без изменений. Не влияет на поведение на
+ * реальном устройстве. */
 int nova_rpc_transport_open(nova_rpc_transport_t *t);
 
+/* registerRPC(programID) — CONFIRMED rpcapi.c:162-188: ioctl(fd,
+ * RPC_IOCTHANDLER, programID) на ВСЕХ открытых read-fd (не на одном
+ * общем /dev/rpc100, как предполагалось в более ранней версии этой
+ * библиотеки — это явное исправление по итогам построчного чтения
+ * rpcapi.c в этой сессии). */
+int nova_rpc_transport_register(nova_rpc_transport_t *t, uint32_t program_id);
+
 /*
- * Отправляет один RPC-вызов: кодирует nova_rpc_struct_t + args (уже
- * сериализованные вызывающим кодом — этот слой не знает про конкретные
- * XDR-схемы отдельных команд, только про сам заголовок) в один буфер и
- * пишет его в выбранный fd. `opt` — комбинация NOVA_RPC_T_* флагов,
- * буквально как в оригинале (ClientStub.c:39, rpcstubapi.c:276).
- *
- * Возвращает число переданных байт при успехе, -errno при ошибке
- * (включая -EMSGSIZE, если args_size переполнил бы буфер — проверка
- * границ, которой в оригинале доверяет вызывающий код, но прямо
- * требуется ТЗ "проверка переполнения").
+ * Отправляет RPC-вызов и, если NOVA_RPC_T_BLOCK_MODE, блокирует вызывающий
+ * поток до ответа (или таймаута). `result_buf`/`result_cap` — куда
+ * скопировать тело ответа (НЕ включая 4-байтовый taskID — он снимается
+ * этим слоем). Возвращает:
+ *   >=0            — число байт реального ответа, скопированных в result_buf
+ *   -ETIMEDOUT     — ответ не пришёл за timeout_ms
+ *   -errno         — ошибка транспорта (open/write)
+ * Если `opt` не содержит BLOCK_MODE, result_buf/result_cap игнорируются,
+ * функция возвращает >=0 сразу после успешной записи (честно — не ответ).
  */
-int nova_rpc_transport_send(nova_rpc_transport_t *t, int opt,
+int nova_rpc_transport_call(nova_rpc_transport_t *t, int opt,
                              uint32_t program_id, uint32_t version_id,
-                             uint32_t procedure_id, uint32_t task_id,
-                             uint32_t context,
-                             const uint8_t *args, size_t args_size);
+                             uint32_t procedure_id,
+                             const uint8_t *args, size_t args_size,
+                             uint8_t *result_buf, size_t result_cap,
+                             int timeout_ms);
 
 /*
- * Блокирующее ожидание ответа — тот же сигнальный механизм, что в
- * rpcstubapi.c:335-363/367-411. `timeout_ms` — если >0, используется
- * sigtimedwait-эквивалент; если 0, ждёт как исходный блокирующий вариант
- * (ограничен внутренним максимумом — см. .c). Возвращает 0 при получении
- * сигнала, -ETIMEDOUT при таймауте, -errno при другой ошибке.
- *
- * ЧЕСТНАЯ ОГОВОРКА: кто и когда реально пошлёт этот сигнал нашему потоку
- * — отдельный, не реализованный в этой библиотеке механизм (должен быть
- * реализован читающим потоком, см. nova_rpc_callbacks.h). Если такой
- * поток не запущен, эта функция всегда завершится по таймауту —
- * это не ошибка библиотеки, а отсутствие второй половины системы.
+ * Вызывается читающим потоком (см. tests/test_rpc_e2e.c за примером) на
+ * каждое сообщение, прочитанное с read-fd. Если заголовок — REPLYID/REPLYID
+ * (99/99), ищет pending-запрос по индексу в `context`, безопасно
+ * копирует результат (или отбрасывает, если запрос уже
+ * COMPLETED/EXPIRED/неизвестен — защита от повторного/запоздавшего
+ * ответа) и поднимает сигнал ожидающему потоку. Возвращает 0, если
+ * сообщение было обработано как ответ, -ENOMSG если это не REPLYID
+ * (вызывающий код должен передать его в nova_rpc_callbacks вместо этого).
  */
-int nova_rpc_transport_wait_reply(int timeout_ms);
+int nova_rpc_transport_dispatch_reply(nova_rpc_transport_t *t,
+                                       const uint8_t *buf, size_t len);
 
-/* Прямой доступ к сигналу, используемому этим транспортом (для
- * установки обработчика извне, как newact.sa_handler в оригинале). */
 int nova_rpc_transport_signal_number(void);
 
 void nova_rpc_transport_close(nova_rpc_transport_t *t);
