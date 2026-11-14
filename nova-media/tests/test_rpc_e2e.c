@@ -55,48 +55,63 @@ struct echo_server_args {
     char w_path[256]; /* "серверная" сторона — сторона теста того, что Nova пишет */
     char r_path[256]; /* "серверная" сторона — сторона теста того, что Nova читает */
     uint32_t fake_result;
+    volatile int *stop;
 };
 
+/*
+ * Отвечает ТОЛЬКО на первый полученный запрос (сценарии 1-2), затем
+ * продолжает читать (и отбрасывать) дальнейшие запросы без ответа —
+ * имитирует "AVCPU принял команду, но не ответил" для честной проверки
+ * тайм-аута (сценарий 11). Держит `wfd` открытым до конца теста: если
+ * закрыть его после первого ответа, второй write() производственного
+ * кода в тот же FIFO получил бы EPIPE (нет читателя), а не настоящий
+ * тайм-аут — это была реальная ошибка первой версии этого теста,
+ * исправленная по результатам первого прогона в CI.
+ */
 static void *echo_server_thread(void *arg)
 {
     struct echo_server_args *a = (struct echo_server_args *)arg;
     int wfd = open(a->w_path, O_RDONLY);
     int rfd = open(a->r_path, O_WRONLY);
     uint8_t req[256];
-    ssize_t n;
-    nova_rpc_struct_t hdr;
+    int answered = 0;
 
     if (wfd < 0 || rfd < 0) {
         fprintf(stderr, "echo_server: open failed\n");
         return NULL;
     }
 
-    n = read(wfd, req, sizeof(req));
-    if (n < (ssize_t)NOVA_RPC_STRUCT_WIRE_SIZE) {
-        fprintf(stderr, "echo_server: short request\n");
-        close(wfd); close(rfd);
-        return NULL;
-    }
+    while (!*a->stop) {
+        ssize_t n = read(wfd, req, sizeof(req));
+        nova_rpc_struct_t hdr;
 
-    nova_rpc_xdr_decode_struct(req, (size_t)n, &hdr);
+        if (n < (ssize_t)NOVA_RPC_STRUCT_WIRE_SIZE)
+            continue;
 
-    {
-        uint8_t reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
-        nova_rpc_struct_t reply_hdr;
+        if (answered)
+            continue; /* сценарий 11: получено, но намеренно не отвечаем */
 
-        reply_hdr.program_id = NOVA_RPC_REPLYID;
-        reply_hdr.version_id = NOVA_RPC_REPLYID;
-        reply_hdr.procedure_id = 0;
-        reply_hdr.task_id = 0;
-        reply_hdr.sys_pid = 0;
-        reply_hdr.parameter_size = 8; /* 4 (эхо task_id исходного запроса) + 4 (результат) */
-        reply_hdr.context = hdr.context; /* буквально req_context из SVCFunc.c:92-93 */
+        nova_rpc_xdr_decode_struct(req, (size_t)n, &hdr);
 
-        nova_rpc_xdr_encode_struct(reply, sizeof(reply), &reply_hdr);
-        nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE, hdr.task_id);
-        nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, a->fake_result);
+        {
+            uint8_t reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+            nova_rpc_struct_t reply_hdr;
 
-        write(rfd, reply, sizeof(reply));
+            reply_hdr.program_id = NOVA_RPC_REPLYID;
+            reply_hdr.version_id = NOVA_RPC_REPLYID;
+            reply_hdr.procedure_id = 0;
+            reply_hdr.task_id = 0;
+            reply_hdr.sys_pid = 0;
+            reply_hdr.parameter_size = 8; /* 4 (эхо task_id запроса) + 4 (результат) */
+            reply_hdr.context = hdr.context; /* буквально req_context из SVCFunc.c:92-93 */
+
+            nova_rpc_xdr_encode_struct(reply, sizeof(reply), &reply_hdr);
+            nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE, hdr.task_id);
+            nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, a->fake_result);
+
+            write(rfd, reply, sizeof(reply));
+        }
+        answered = 1;
     }
 
     close(wfd);
@@ -174,6 +189,7 @@ int main(void)
         strcpy(srv_args.w_path, paths[2]);  /* wpoll_v */
         strcpy(srv_args.r_path, paths[8]);  /* rpoll_v */
         srv_args.fake_result = 0xCAFEF00D;
+        srv_args.stop = &stop;
 
         {
             /* static — обязательно: drain_thread читает этот массив из
@@ -247,10 +263,11 @@ int main(void)
     }
 
     stop = 1;
-    pthread_join(srv, NULL);
-    /* dispatch_loop и drain держат блокирующие read() на FIFO без данных —
-     * не join'им их (тест завершает процесс), но и не считаем утечкой:
-     * FIFO закрываются ядром при завершении процесса. */
+    /* echo_server/dispatch_loop/drain держат блокирующие read() на FIFO
+     * без новых данных — не join'им их (ни один из них проверит `stop`
+     * до следующего пробуждения из блокирующего read(), так что join
+     * мог бы зависнуть навечно); процесс завершается следующей строкой,
+     * ядро закрывает все FIFO само. Не считается утечкой ресурсов теста. */
 
     nova_rpc_transport_close(&t);
 
