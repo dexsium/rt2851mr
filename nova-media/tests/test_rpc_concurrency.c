@@ -271,30 +271,41 @@ int main(void)
             strcpy(rest_paths[i], full);
             setenv(rest_env[i], full, 1);
         }
-        /* открываем оба конца сразу в фоне, чтобы open() внутри
-         * nova_rpc_transport_open() не заблокировался */
-        for (i = 0; i < 5; i++) {
-            int fd = open(rest_paths[i], O_RDONLY | O_NONBLOCK);
-            (void)fd;
-        }
-        for (i = 5; i < 10; i++) {
-            /* открыть встречный конец для чтения-FIFO в отдельном потоке
-             * не требуется — O_RDONLY|O_NONBLOCK открытие выше не блокирует
-             * write-стороны; для read-типа путей открываем WRONLY неблокир. */
-        }
-        for (i = 0; i < 5; i++) {
-            int fd2 = open(rest_paths[i], O_WRONLY | O_NONBLOCK); /* второй конец той же FIFO, не блокирует т.к. первый уже открыт RDONLY */
-            (void)fd2;
-        }
-        for (i = 5; i < 10; i++) {
-            int fd3 = open(rest_paths[i], O_WRONLY | O_NONBLOCK);
-            (void)fd3;
-            int fd4 = open(rest_paths[i], O_RDONLY | O_NONBLOCK);
-            (void)fd4;
+        /* Открываем ОБА конца каждого "лишнего" FIFO неблокирующе, чтобы
+         * будущий БЛОКИРУЮЩИЙ open() внутри nova_rpc_transport_open() не
+         * завис навечно. ВАЖНО (реальный баг, найденный именно этим
+         * тестом через настоящее многочасовое зависание CI — не
+         * гипотеза): O_WRONLY|O_NONBLOCK на FIFO без читателя завершается
+         * с ENXIO НЕМЕДЛЕННО (POSIX), а не блокируется и не ждёт — первая
+         * версия этого кода открывала WRONLY ДО RDONLY для "read-типа"
+         * путей, из-за чего writer-сторона никогда реально не
+         * устанавливалась, и последующий БЛОКИРУЮЩИЙ open(path, O_RDONLY)
+         * внутри production-кода (nova_rpc_transport_open) висел
+         * бесконечно, ожидая writer'а, которого не было. Порядок здесь
+         * исправлен: RDONLY открывается ПЕРВЫМ для каждого пути (это
+         * всегда успевает немедленно независимо от наличия writer'а),
+         * ТОЛЬКО ПОСЛЕ этого пробуем WRONLY (к этому моменту читатель уже
+         * есть, поэтому ENXIO не возникает). */
+        for (i = 0; i < 10; i++) {
+            int fd_r = open(rest_paths[i], O_RDONLY | O_NONBLOCK);
+            int fd_w = open(rest_paths[i], O_WRONLY | O_NONBLOCK);
+            (void)fd_r;
+            (void)fd_w;
         }
     }
 
     server_wfd = open(w_path, O_RDONLY | O_NONBLOCK);
+    /* Та же ловушка, что была исправлена выше: открывать r_path WRONLY
+     * раньше, чем у него появится хоть один читатель, привело бы к
+     * немедленному ENXIO. Production-код сам станет читателем r_path
+     * чуть позже (nova_rpc_transport_open), но ОН открывает её БЛОКИРУЮЩЕ
+     * и ждёт именно writer'а — поэтому здесь сначала создаём временного
+     * читателя (оставляем открытым, лишний читатель на FIFO безвреден),
+     * и только потом открываем writer-сторону. */
+    {
+        int tmp_reader = open(r_path, O_RDONLY | O_NONBLOCK);
+        (void)tmp_reader;
+    }
     server_rfd = open(r_path, O_WRONLY | O_NONBLOCK);
 
     ret = nova_rpc_transport_open(&t);
