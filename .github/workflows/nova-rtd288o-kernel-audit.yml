@@ -42,10 +42,11 @@ jobs:
       - name: Generate .config
         run: |
           cd src/kernel
+          # make's %config pattern rule prepends arch/$(ARCH)/configs/ itself -- the target name
+          # must be relative to that directory, not include it (fixed after run 43616615430 failed
+          # with "Can't find default configuration arch/arm/configs/arch/arm/configs/realtek/...").
           make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
-            arch/arm/configs/realtek/${{ env.DEFCONFIG }}
-          cp arch/arm/configs/realtek/${{ env.DEFCONFIG }} .config 2>/dev/null || true
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig || true
+            realtek/${{ env.DEFCONFIG }}
           cp .config "$GITHUB_WORKSPACE/config.generated.txt"
 
       - name: Build kernel (real attempt, no fake success)
