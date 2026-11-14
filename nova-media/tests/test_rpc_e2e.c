@@ -176,7 +176,11 @@ int main(void)
         srv_args.fake_result = 0xCAFEF00D;
 
         {
-            char *drain_paths[10];
+            /* static — обязательно: drain_thread читает этот массив из
+             * отдельного потока, который может пережить возврат из этого
+             * блока; обычный локальный массив указателей здесь привёл бы
+             * к use-after-scope (поймано ASan в CI, см. отчёт). */
+            static char *drain_paths[10];
             static char storage[10][256];
             int idx = 0, j;
             for (j = 0; j < 12; j++) {
