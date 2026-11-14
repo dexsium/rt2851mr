@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Build nova-rtk-rpc / nova-vdec / nova-frame / nova-decoder-diagnostics (ARM32)
+      - name: Build nova-rtk-rpc (+video/vo) / nova-vdec / nova-frame / nova-decoder-diagnostics (ARM32)
         run: |
           cd nova-media
           make CROSS_COMPILE=arm-linux-gnueabihf-
@@ -54,11 +54,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and run ioctl ABI mock test (host x86_64, Уровень A/B)
+      - name: Build and run ioctl ABI + RPC protocol mock tests (host x86_64, Уровень A/B)
         run: |
           cd nova-media
-          make test_ioctl_abi CROSS_COMPILE=
-          ./test_ioctl_abi | tee ../abi-mock-test-report.txt
+          make test_ioctl_abi test_rpc_protocol CROSS_COMPILE=
+          { ./test_ioctl_abi; echo; ./test_rpc_protocol; } | tee ../abi-mock-test-report.txt
 
       - uses: actions/upload-artifact@v4
         with:
