@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,24 @@
 
 #include "../nova-rtk-rpc/nova_rpc_protocol.h"
 #include "../nova-rtk-rpc/nova_rpc_transport.h"
+
+static void watchdog_handler(int sig)
+{
+    (void)sig;
+    const char msg[] = "\nFAIL watchdog: test exceeded wall-clock budget, aborting (likely deadlock)\n";
+    write(2, msg, sizeof(msg) - 1);
+    _exit(97);
+}
+
+static void install_watchdog(unsigned seconds)
+{
+    struct sigaction sa;
+    sa.sa_handler = watchdog_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(seconds);
+}
 
 static char g_dir[256];
 static int g_passed = 0, g_failed = 0;
@@ -180,6 +199,7 @@ int main(void)
     int ret;
     uint8_t result[4];
 
+    install_watchdog(30);
     snprintf(g_dir, sizeof(g_dir), "/tmp/nova_rpc_e2e_%d", (int)getpid());
     mkdir(g_dir, 0700);
 
