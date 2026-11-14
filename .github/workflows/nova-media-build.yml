@@ -1,16 +1,16 @@
 name: nova-media-build
 
-# Реальная сборка userspace-компонентов Nova (nova-vdec, nova-rtk-rpc,
-# nova-decoder-diagnostics) кросс-тулчейном ARM32 — той же архитектурой,
-# что у реального устройства. Это ПРОВЕРКА КОМПИЛЯЦИИ заголовков/ABI,
-# написанных на основе rtk_vdec.h и rpcapi.h, НЕ сборка или прошивка ядра.
-# Ничего не устанавливается на устройство.
+# Сборка и проверка userspace-компонентов Nova (nova-vdec, nova-rtk-rpc,
+# nova-frame, nova-decoder-diagnostics) кросс-тулчейном ARM32 — той же
+# архитектурой, что у реального устройства. Плюс mock/ABI-регрессионный
+# тест (test_ioctl_abi), выполняемый на хосте (x86_64), и статическая
+# проверка. Ничего не устанавливается на устройство, прошивка не создаётся.
 
 on:
   workflow_dispatch: {}
 
 jobs:
-  build:
+  build-arm32:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,12 +20,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
 
-      - name: Build nova-vdec / nova-rtk-rpc / nova-decoder-diagnostics
+      - name: Build nova-rtk-rpc / nova-vdec / nova-frame / nova-decoder-diagnostics (ARM32)
         run: |
           cd nova-media
           make CROSS_COMPILE=arm-linux-gnueabihf-
 
-      - name: Verify ARM binary
+      - name: Verify ARM32 ELF
         run: |
           cd nova-media
           file nova_vdec_diag
@@ -33,6 +33,39 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: nova-media-build-${{ github.run_id }}
+          name: nova-decoder-diagnostics-${{ github.run_id }}
           path: nova-media/nova_vdec_diag
           retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-vdec-objects-${{ github.run_id }}
+          path: nova-media/nova_vdec.o
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-rtk-rpc-objects-${{ github.run_id }}
+          path: nova-media/nova_rpc.o
+          retention-days: 14
+
+  abi-mock-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run ioctl ABI mock test (host x86_64, Уровень A/B)
+        run: |
+          cd nova-media
+          make test_ioctl_abi CROSS_COMPILE=
+          ./test_ioctl_abi | tee ../abi-mock-test-report.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nova-media-test-report-${{ github.run_id }}
+          path: abi-mock-test-report.txt
+          retention-days: 14
+
+  # gstreamer-nova-rtk НЕ собирается в этом job: нужны libgstreamer1.0-dev /
+  # libgstvideo-1.0-dev, которые в этой сессии не добавлены и не проверены
+  # (честно NOT COMPILED, см. NOVA_VDEC_FRAME_OUTPUT_IMPLEMENTATION.md §13).
