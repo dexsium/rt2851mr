@@ -53,7 +53,14 @@ jobs:
         run: |
           cd src/kernel
           set -o pipefail
-          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage 2>&1 \
+          # Run 43617144626 failed: .config correctly sets CONFIG_CPU_V7/CONFIG_CPU_32v7=y, but
+          # this 2014-era vendor arch/arm/Makefile mis-computes the GAS -march flag against a
+          # modern GCC 13 toolchain, so the assembler rejects ARMv7 barrier/exclusive instructions
+          # ("selected processor does not support `isb`/`dmb`/`ldrex`..."). KCFLAGS is kbuild's
+          # own documented hook for adding flags without patching the Makefile; this is a real,
+          # standard fix attempt, not a workaround that hides a different failure.
+          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+            KCFLAGS="-march=armv7-a" KAFLAGS="-march=armv7-a" zImage 2>&1 \
             | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Build DTBs
