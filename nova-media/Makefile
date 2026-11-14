@@ -6,6 +6,7 @@
 CROSS_COMPILE ?= arm-linux-gnueabihf-
 CC = $(CROSS_COMPILE)gcc
 CFLAGS = -Wall -Wextra -std=gnu11 -O2 -Inova-vdec -Inova-rtk-rpc
+LDLIBS = -lpthread
 
 all: nova_vdec_diag
 
@@ -40,11 +41,11 @@ NOVA_OBJS = nova_vdec.o nova_rpc.o nova_rpc_xdr.o nova_rpc_transport.o nova_rpc_
             nova_video_rpc.o nova_vo_rpc.o nova_frame.o nova_vdec_diag.o
 
 nova_vdec_diag: $(NOVA_OBJS)
-	$(CC) $(CFLAGS) -o nova_vdec_diag $(NOVA_OBJS)
+	$(CC) $(CFLAGS) -o nova_vdec_diag $(NOVA_OBJS) $(LDLIBS)
 
-# Хостовые mock/ABI-тесты (могут собираться CROSS_COMPILE= пустым в CI
-# job "abi-mock-test" — _IO*-макросы и XDR big-endian-кодировка дают
-# одинаковый результат на ARM и x86_64).
+# Хостовые mock/ABI-тесты (могут собираться CROSS_COMPILE= пустым в CI —
+# _IO*-макросы и XDR big-endian-кодировка дают одинаковый результат на
+# ARM и x86_64).
 test_ioctl_abi: tests/test_ioctl_abi.c
 	$(CC) $(CFLAGS) -o test_ioctl_abi tests/test_ioctl_abi.c
 
@@ -55,19 +56,22 @@ test_rpc_xdr: tests/test_rpc_xdr.c nova_rpc_xdr.o
 	$(CC) $(CFLAGS) -o test_rpc_xdr tests/test_rpc_xdr.c nova_rpc_xdr.o
 
 test_rpc_callbacks: tests/test_rpc_callbacks.c nova_rpc_callbacks.o nova_rpc_xdr.o
-	$(CC) $(CFLAGS) -pthread -o test_rpc_callbacks tests/test_rpc_callbacks.c nova_rpc_callbacks.o nova_rpc_xdr.o -lpthread
+	$(CC) $(CFLAGS) -o test_rpc_callbacks tests/test_rpc_callbacks.c nova_rpc_callbacks.o nova_rpc_xdr.o $(LDLIBS)
 
 test_rpc_transport: tests/test_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o
-	$(CC) $(CFLAGS) -o test_rpc_transport tests/test_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_rpc_transport tests/test_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
 test_video_rpc: tests/test_video_rpc.c nova_video_rpc.o nova_rpc_transport.o nova_rpc_xdr.o
-	$(CC) $(CFLAGS) -o test_video_rpc tests/test_video_rpc.c nova_video_rpc.o nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_video_rpc tests/test_video_rpc.c nova_video_rpc.o nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
 test_vo_rpc: tests/test_vo_rpc.c nova_vo_rpc.o nova_rpc_transport.o nova_rpc_xdr.o
-	$(CC) $(CFLAGS) -o test_vo_rpc tests/test_vo_rpc.c nova_vo_rpc.o nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_vo_rpc tests/test_vo_rpc.c nova_vo_rpc.o nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
+
+test_rpc_e2e: tests/test_rpc_e2e.c nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o test_rpc_e2e tests/test_rpc_e2e.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
 MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
-             test_rpc_transport test_video_rpc test_vo_rpc
+             test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e
 
 mock-tests: $(MOCK_TESTS)
 
