@@ -81,9 +81,16 @@ jobs:
       - name: Build DTBs
         run: |
           cd src/kernel
-          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
-            arch/arm/boot/dts/rtd288o.dtb arch/arm/boot/dts/rtd288o_P.dtb \
-            arch/arm/boot/dts/rtd288o_Q.dtb 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          set -o pipefail
+          # Explicit "arch/arm/boot/dts/<name>.dtb" targets doubled their own path for whichever
+          # file didn't already exist (run 43622915468: rtd288o.dtb/_P.dtb were silently already
+          # built as a side effect of the zImage step and skipped untouched by make, but the
+          # never-built rtd288o_Q.dtb hit a real "arch/arm/boot/dts/arch/arm/boot/dts/..." error
+          # that went unnoticed because this step lacked pipefail). The generic "dtbs" target lets
+          # kbuild resolve its own paths instead of us guessing the target-name convention again.
+          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- dtbs 2>&1 \
+            | tee -a "$GITHUB_WORKSPACE/build.log"
+          ls -la arch/arm/boot/dts/rtd288o*.dtb
 
       - name: Collect artifacts (only what actually exists — no placeholder files)
         if: always()
