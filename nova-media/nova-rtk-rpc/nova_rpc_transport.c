@@ -286,6 +286,15 @@ int nova_rpc_transport_dispatch_reply(nova_rpc_transport_t *t,
     if (payload_size > hdr.parameter_size)
         payload_size = hdr.parameter_size;
 
+    /* Буквально SVCFunc.c:78-89: первые 4 байта payload — result_taskID
+     * (XDR u_long), снимаются ПЕРЕД memcpy в буфер результата. Пропущено
+     * в первой версии этого файла — поймано сквозным (e2e) mock-тестом
+     * (test_rpc_e2e.c, "Сценарий 2"), не угадано постфактум. */
+    if (payload_size < 4)
+        return -EBADMSG;
+    payload += 4;
+    payload_size -= 4;
+
     if (slot < 0 || slot >= NOVA_RPC_T_MAX_PENDING)
         return -ENOENT; /* повреждённый/неизвестный context — безопасно игнорируем */
 
@@ -294,7 +303,13 @@ int nova_rpc_transport_dispatch_reply(nova_rpc_transport_t *t,
         /* EXPIRED (запоздавший ответ) или FREE (неизвестный/повторный
          * ответ) — отбрасываем безопасно, НЕ трогаем result_buf (который
          * мог уже быть освобождён вызывающим кодом после тайм-аута). Это
-         * и есть защита от use-after-free, которой нет в оригинале. */
+         * и есть защита от use-after-free, которой нет в оригинале.
+         * EXPIRED-слот реклеймится здесь же (FREE) — опоздавший ответ
+         * пришёл и больше не нужен, слот можно отдать следующему
+         * вызову, не оставляя его занятым навсегда. */
+        int was_expired = (t->pending[slot].state == NOVA_RPC_PENDING_EXPIRED);
+        if (was_expired)
+            t->pending[slot].state = NOVA_RPC_PENDING_FREE;
         pthread_mutex_unlock(&t->pending_mutex);
         return -ESTALE;
     }
