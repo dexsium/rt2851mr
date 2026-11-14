@@ -55,11 +55,20 @@ extern "C" {
 #define NOVA_RPC_T_SEND_VIDEO_CPU2  0x08
 
 #define NOVA_RPC_T_MAX_PENDING 64
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#include <assert.h>
+_Static_assert(NOVA_RPC_T_MAX_PENDING == 64,
+               "NOVA_RPC_T_MAX_PENDING must stay 64 to fit the 6-bit slot index packed into context");
+#endif
 
 typedef enum nova_rpc_pending_state {
     NOVA_RPC_PENDING_FREE = 0,
     NOVA_RPC_PENDING_WAITING,
     NOVA_RPC_PENDING_COMPLETED,
+    /* Больше не используется текущей реализацией (см. .c): после
+     * добавления generation-защиты от ABA тайм-аут переводит слот прямо
+     * в FREE, не в EXPIRED — сохранено в enum только для обратной
+     * совместимости кода/тестов, которые могли ссылаться на это имя. */
     NOVA_RPC_PENDING_EXPIRED
 } nova_rpc_pending_state_t;
 
@@ -69,7 +78,25 @@ typedef struct nova_rpc_pending {
     size_t result_cap;
     size_t result_len;
     nova_rpc_pending_state_t state;
+    /* Защита от ABA (найдена и устранена в этом этапе ТЗ, раздел
+     * "Concurrency Audit" итогового отчёта): если бы тайм-аут сразу
+     * освобождал слот (FREE) для переиспользования, опоздавший ответ на
+     * СТАРЫЙ запрос мог бы по тому же индексу слота попасть НОВОМУ
+     * запросу, который уже успел переиспользовать этот индекс —
+     * повреждение результата чужого вызова. `generation` увеличивается
+     * при каждом новом выделении слота; `context` на проводе кодирует
+     * ОБА значения (индекс + generation), и dispatch_reply сверяет оба,
+     * не только индекс. */
+    uint32_t generation;
 } nova_rpc_pending_t;
+
+/* context = (generation << NOVA_RPC_T_SLOT_BITS) | slot_index.
+ * NOVA_RPC_T_MAX_PENDING=64=2^6, поэтому 6 бит индекса достаточно;
+ * оставшиеся 26 бит — generation (переполнение раз в 2^26 выделений
+ * одного слота — не достижимо в пределах теста или разумной работы
+ * процесса). */
+#define NOVA_RPC_T_SLOT_BITS 6
+#define NOVA_RPC_T_SLOT_MASK ((1u << NOVA_RPC_T_SLOT_BITS) - 1)
 
 typedef struct nova_rpc_transport {
     /* write-side (отправка), CONFIRMED rpcstubapi.c:76-85 */
