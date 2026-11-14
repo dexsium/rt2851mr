@@ -1,17 +1,13 @@
 /*
- * nova_video_rpc — DEC-команды Realtek Video RPC поверх РЕАЛЬНОГО
- * транспорта (nova_rpc_transport), не заглушки. program_id=100
- * (NOVA_RPC_PROGRAM_VIDEO_SYSTEM, CONFIRMED VideoRPC_System.h:22),
- * version=0.
+ * nova_video_rpc — DEC-команды Video RPC поверх РЕАЛЬНОГО двустороннего
+ * транспорта (nova_rpc_transport_call — отправка + приём ответа, см.
+ * nova_rpc_transport.h). program_id=100 (CONFIRMED VideoRPC_System.h:22).
  *
- * Отправка (nova_rpc_transport_send) теперь реальна (см.
- * nova_rpc_transport.h). Приёмная сторона (чтение ответа/распаковка
- * RPCRES_LONG) честно НЕ реализована — у нас нет подтверждённого способа
- * прочитать входящий ring buffer (см. честную оговорку в
- * nova_rpc_callbacks.h), поэтому каждая функция здесь отправляет запрос
- * по-настоящему, но результат (`-ENOTSUP` в `reply_status`) помечен явно
- * как не прочитанный, а не выдуман успешным — прямое требование ТЗ
- * "если точная семантика неизвестна, возвращай -ENOTSUP".
+ * `last_reply_status`: 0 = ответ реально получен и скопирован в
+ * `last_reply_raw`; -ETIMEDOUT = не получен за timeout; других
+ * отрицательных errno — ошибка транспорта при отправке. НЕ являются
+ * фиктивным успехом — если AVCPU недоступен (нет устройства/нет
+ * прошивки), это будет либо ошибка open(), либо честный -ETIMEDOUT.
  */
 #ifndef NOVA_VIDEO_RPC_H
 #define NOVA_VIDEO_RPC_H
@@ -25,40 +21,18 @@
 extern "C" {
 #endif
 
-/* Буквально VideoRPC_Agent_data.h:250-297 (см. предыдущий отчёт). */
-typedef struct nova_video_rpc_frame_info {
-    long instance_id;
-    unsigned int pts_high;
-    unsigned int pts_low;
-    unsigned char frame_type;
-} nova_video_rpc_frame_info_t;
-
-typedef struct nova_video_rpc_media_info {
-    long instance_id;
-    unsigned int width;
-    unsigned int height;
-    unsigned int frame_rate;
-    unsigned int level;
-    unsigned int profile;
-} nova_video_rpc_media_info_t;
+#define NOVA_VIDEO_RPC_DEFAULT_TIMEOUT_MS 5000
 
 typedef struct nova_video_rpc_session {
     nova_rpc_transport_t transport;
     long instance_id;
-    uint32_t next_task_id;   /* инкрементальный, роль taskID — см. .c */
-    /* reply_status != 0, пока reply не прочитан по-настоящему (честно
-     * ENOTSUP) — см. комментарий в заголовке файла. */
     int last_reply_status;
+    uint8_t last_reply_raw[64];
+    size_t last_reply_len;
 } nova_video_rpc_session_t;
 
 int nova_video_rpc_open(nova_video_rpc_session_t *s);
 
-/* Каждая функция реально отправляет RPC-вызов (program=100, конкретный
- * procedureID из nova_rpc_protocol.h) через nova_rpc_transport_send().
- * Возвращает >=0 (число отправленных байт) при успешной ОТПРАВКЕ,
- * отрицательный errno при ошибке транспорта. Успешная отправка НЕ
- * означает успешное выполнение на AVCPU — s->last_reply_status остаётся
- * -ENOTSUP, пока приёмная сторона не реализована (см. выше). */
 int nova_video_rpc_create(nova_video_rpc_session_t *s);         /* 10 */
 int nova_video_rpc_video_create(nova_video_rpc_session_t *s);   /* 100 */
 int nova_video_rpc_dec_init(nova_video_rpc_session_t *s);       /* 1020 */
