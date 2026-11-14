@@ -78,6 +78,60 @@ static ssize_t poll_read(int fd, void *buf, size_t cap, const volatile int *stop
     return 0;
 }
 
+/*
+ * РЕАЛЬНЫЙ баг, найденный именно этим тестом (не гипотеза): с несколькими
+ * конкурентными писателями в один и тот же FIFO один вызов read() с
+ * буфером БОЛЬШЕ размера одного сообщения может захватить байты ДВУХ (или
+ * более) сообщений сразу, что ломает разбор совершенно непредсказуемо —
+ * именно это вызывало FAIL во всех сценариях 2/8/32/64 на предыдущем
+ * прогоне CI (run 43647629010, до этого исправления). Решение —
+ * буквально то же самое, что делает оригинальный `RPCProxy_loop()`
+ * (`RPCProxy.c:88-97`, предыдущие этапы): читать РОВНО `sizeof(RPC_STRUCT)`
+ * байт заголовка, затем РОВНО `parameterSize` байт полезной нагрузки —
+ * двумя отдельными точными чтениями, не одним произвольного размера.
+ */
+static ssize_t read_exact(int fd, void *buf, size_t n, const volatile int *stop)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = poll_read(fd, (uint8_t *)buf + got, n - got, stop);
+        if (r < 0)
+            return -1;
+        if (r == 0) {
+            if (*stop)
+                return (ssize_t)got;
+            continue; /* poll_read() вернул 0 из-за stop-проверки внутри своего цикла — не EOF */
+        }
+        got += (size_t)r;
+    }
+    return (ssize_t)got;
+}
+
+/* Читает ровно одно RPC-сообщение (заголовок + его реальный payload) в
+ * буфер `buf` (должен быть достаточного размера), возвращает общий размер
+ * или -1/0 при ошибке/остановке. */
+static ssize_t read_one_message(int fd, uint8_t *buf, size_t cap, const volatile int *stop)
+{
+    nova_rpc_struct_t hdr;
+    ssize_t n;
+    size_t total;
+
+    n = read_exact(fd, buf, NOVA_RPC_STRUCT_WIRE_SIZE, stop);
+    if (n != (ssize_t)NOVA_RPC_STRUCT_WIRE_SIZE)
+        return n;
+
+    nova_rpc_xdr_decode_struct(buf, NOVA_RPC_STRUCT_WIRE_SIZE, &hdr);
+    total = NOVA_RPC_STRUCT_WIRE_SIZE + hdr.parameter_size;
+    if (total > cap)
+        return -1; /* не должно происходить в этом тесте, но не читаем за границу буфера */
+
+    n = read_exact(fd, buf + NOVA_RPC_STRUCT_WIRE_SIZE, hdr.parameter_size, stop);
+    if (n != (ssize_t)hdr.parameter_size)
+        return -1;
+
+    return (ssize_t)total;
+}
+
 enum reply_order { ORDER_FORWARD, ORDER_REVERSE, ORDER_RANDOM };
 
 struct captured_req {
@@ -103,7 +157,7 @@ static void *echo_n_server(void *arg)
 
     while (got < a->n && !*a->stop) {
         uint8_t req[64];
-        ssize_t n = poll_read(a->rfd_write_side, req, sizeof(req), a->stop);
+        ssize_t n = read_one_message(a->rfd_write_side, req, sizeof(req), a->stop);
         if (n < (ssize_t)(NOVA_RPC_STRUCT_WIRE_SIZE + 4))
             continue;
         nova_rpc_xdr_decode_struct(req, (size_t)n, &reqs[got].hdr);
@@ -159,7 +213,7 @@ static void *dispatch_thread(void *arg)
     uint8_t buf[256];
 
     while (!*a->stop) {
-        ssize_t n = poll_read(a->rfd, buf, sizeof(buf), a->stop);
+        ssize_t n = read_one_message(a->rfd, buf, sizeof(buf), a->stop);
         if (n > 0)
             nova_rpc_transport_dispatch_reply(a->t, buf, (size_t)n);
     }
