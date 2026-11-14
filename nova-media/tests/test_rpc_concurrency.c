@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h> /* atomic_int для stop-флагов — найдено TSan, см. test_rpc_e2e.c */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +66,7 @@ static int g_passed = 0, g_failed = 0;
 #define POLL_STEP_MS 20
 #define MAX_N 65
 
-static ssize_t poll_read(int fd, void *buf, size_t cap, const volatile int *stop)
+static ssize_t poll_read(int fd, void *buf, size_t cap, const atomic_int *stop)
 {
     while (!*stop) {
         struct pollfd pfd = { fd, POLLIN, 0 };
@@ -90,7 +91,7 @@ static ssize_t poll_read(int fd, void *buf, size_t cap, const volatile int *stop
  * байт заголовка, затем РОВНО `parameterSize` байт полезной нагрузки —
  * двумя отдельными точными чтениями, не одним произвольного размера.
  */
-static ssize_t read_exact(int fd, void *buf, size_t n, const volatile int *stop)
+static ssize_t read_exact(int fd, void *buf, size_t n, const atomic_int *stop)
 {
     size_t got = 0;
     while (got < n) {
@@ -110,7 +111,7 @@ static ssize_t read_exact(int fd, void *buf, size_t n, const volatile int *stop)
 /* Читает ровно одно RPC-сообщение (заголовок + его реальный payload) в
  * буфер `buf` (должен быть достаточного размера), возвращает общий размер
  * или -1/0 при ошибке/остановке. */
-static ssize_t read_one_message(int fd, uint8_t *buf, size_t cap, const volatile int *stop)
+static ssize_t read_one_message(int fd, uint8_t *buf, size_t cap, const atomic_int *stop)
 {
     nova_rpc_struct_t hdr;
     ssize_t n;
@@ -144,7 +145,7 @@ struct echo_n_args {
     int wfd_read_side;  /* "серверная" сторона video-poll read-FIFO (WRONLY) */
     int n;
     enum reply_order order;
-    volatile int *stop;
+    atomic_int *stop;
 };
 
 static void *echo_n_server(void *arg)
@@ -204,7 +205,7 @@ static void *echo_n_server(void *arg)
 struct dispatch_args {
     nova_rpc_transport_t *t;
     int rfd;
-    volatile int *stop;
+    atomic_int *stop;
 };
 
 static void *dispatch_thread(void *arg)
@@ -251,7 +252,7 @@ static int run_n_concurrent(nova_rpc_transport_t *t, int n, enum reply_order ord
     struct client_args cargs[MAX_N];
     pthread_t srv;
     struct echo_n_args srv_args;
-    volatile int stop = 0;
+    atomic_int stop = 0;
     int i, ok_count = 0;
 
     srv_args.rfd_write_side = wfd_write_side;
@@ -287,7 +288,7 @@ int main(void)
     nova_rpc_transport_t t;
     pthread_t disp;
     struct dispatch_args disp_args;
-    volatile int stop = 0;
+    atomic_int stop = 0;
     int ret;
     int server_wfd, server_rfd;
 
