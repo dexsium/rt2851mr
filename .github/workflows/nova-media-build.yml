@@ -1,10 +1,10 @@
 name: nova-media-build
 
 # Сборка Nova RPC transport/XDR/callbacks + Video/VO RPC для трёх
-# архитектур (ARM32 — реальное устройство, ARM64, x86_64 — переносимость
-# ABI), плюс полный набор mock/e2e-тестов на хосте (x86_64) с
-# AddressSanitizer/UBSan. Ничего не устанавливается на устройство,
-# прошивка не создаётся, никакие ioctl/RPC на реальный ТВ не отправляются.
+# архитектур, плюс полный набор unit/e2e/concurrency/lifecycle-тестов на
+# хосте (x86_64) с ASan+UBSan и отдельно с ThreadSanitizer. Ничего не
+# устанавливается на устройство, прошивка не создаётся, никакие ioctl/RPC
+# на реальный ТВ не отправляются.
 
 on:
   workflow_dispatch: {}
@@ -42,23 +42,17 @@ jobs:
           cd nova-media
           make CROSS_COMPILE=aarch64-linux-gnu- 2>&1 | tee build-arm64.log
           grep -i "warning:" build-arm64.log || echo "no warnings"
-      - run: |
-          cd nova-media
-          file nova_vdec_diag
-          aarch64-linux-gnu-readelf -h nova_vdec_diag | grep -i "Machine\|Class"
       - uses: actions/upload-artifact@v4
         with:
           name: nova-media-arm64-${{ github.run_id }}
-          path: |
-            nova-media/nova_vdec_diag
-            nova-media/build-arm64.log
+          path: nova-media/build-arm64.log
           retention-days: 14
 
   build-x86_64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build (x86_64 native — для запуска mock/e2e-тестов)
+      - name: Build (x86_64 native)
         run: |
           cd nova-media
           make CROSS_COMPILE= 2>&1 | tee build-x86_64.log
@@ -69,30 +63,80 @@ jobs:
           path: nova-media/build-x86_64.log
           retention-days: 14
 
-  mock-and-e2e-tests:
+  unit-and-e2e-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: gcc --version
-      - name: Build and run ALL mock/e2e tests with ASan+UBSan (host x86_64)
+      - name: Build and run unit + e2e tests with ASan+UBSan
         run: |
           cd nova-media
-          make mock-tests CROSS_COMPILE= CFLAGS="-Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-vdec -Inova-rtk-rpc"
+          make test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
+              test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e \
+              CROSS_COMPILE= CFLAGS="-Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-vdec -Inova-rtk-rpc"
           STATUS=0
           for t in test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e; do
-            echo "=== $t ===" | tee -a ../mock-test-report.txt
-            ./$t 2>&1 | tee -a ../mock-test-report.txt
+            echo "=== $t ===" | tee -a ../unit-e2e-report.txt
+            ./$t 2>&1 | tee -a ../unit-e2e-report.txt
             rc=${PIPESTATUS[0]}
-            echo "exit=$rc" | tee -a ../mock-test-report.txt
+            echo "exit=$rc" | tee -a ../unit-e2e-report.txt
             if [ "$rc" -ne 0 ]; then STATUS=1; fi
           done
           exit $STATUS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nova-media-test-report-${{ github.run_id }}
-          path: mock-test-report.txt
+          name: nova-media-unit-e2e-report-${{ github.run_id }}
+          path: unit-e2e-report.txt
           retention-days: 14
 
-  # gstreamer-nova-rtk НЕ собирается: вне приоритета этого этапа (ТЗ §16:
-  # транспорт/XDR/callback — приоритет 1-3, GStreamer — приоритет 7).
+  concurrency-and-lifecycle-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run concurrency + lifecycle tests with ASan+UBSan
+        run: |
+          cd nova-media
+          make test_rpc_concurrency test_rpc_lifecycle \
+              CROSS_COMPILE= CFLAGS="-Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-vdec -Inova-rtk-rpc"
+          STATUS=0
+          for t in test_rpc_concurrency test_rpc_lifecycle; do
+            echo "=== $t ===" | tee -a ../conc-lifecycle-report.txt
+            ./$t 2>&1 | tee -a ../conc-lifecycle-report.txt
+            rc=${PIPESTATUS[0]}
+            echo "exit=$rc" | tee -a ../conc-lifecycle-report.txt
+            if [ "$rc" -ne 0 ]; then STATUS=1; fi
+          done
+          exit $STATUS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nova-media-conc-lifecycle-report-${{ github.run_id }}
+          path: conc-lifecycle-report.txt
+          retention-days: 14
+
+  tsan-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run concurrency + e2e tests with ThreadSanitizer
+        run: |
+          cd nova-media
+          make test_rpc_e2e test_rpc_concurrency test_rpc_lifecycle \
+              CROSS_COMPILE= CFLAGS="-Wall -Wextra -std=gnu11 -O0 -g -fsanitize=thread -Inova-vdec -Inova-rtk-rpc"
+          STATUS=0
+          for t in test_rpc_e2e test_rpc_concurrency test_rpc_lifecycle; do
+            echo "=== $t (TSan) ===" | tee -a ../tsan-report.txt
+            ./$t 2>&1 | tee -a ../tsan-report.txt
+            rc=${PIPESTATUS[0]}
+            echo "exit=$rc" | tee -a ../tsan-report.txt
+            if [ "$rc" -ne 0 ]; then STATUS=1; fi
+          done
+          exit $STATUS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nova-media-tsan-report-${{ github.run_id }}
+          path: tsan-report.txt
+          retention-days: 14
+
+  # gstreamer-nova-rtk НЕ собирается: вне приоритета этого этапа.
