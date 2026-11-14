@@ -35,8 +35,9 @@ static long nova_gettid_fallback(void)
  * в заголовке всё равно заполняется (gettid()) — для совместимости
  * формата сообщения с оригинальным ABI, даже если Nova не использует
  * его для своего внутреннего пробуждения. */
-static pthread_mutex_t g_cond_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_cond       = PTHREAD_COND_INITIALIZER;
+/* g_cond/g_cond_mutex глобальными больше не являются — перенесены в
+ * nova_rpc_transport_t (pending_mutex/pending_cond), см. комментарий в
+ * .h про найденную ThreadSanitizer гонку данных. */
 
 static const char *nova_env_or(const char *env_name, const char *fallback)
 {
@@ -87,6 +88,7 @@ int nova_rpc_transport_open(nova_rpc_transport_t *t)
     }
 
     pthread_mutex_init(&t->pending_mutex, NULL);
+    pthread_cond_init(&t->pending_cond, NULL);
     t->opened = 1;
     return 0;
 }
@@ -228,8 +230,12 @@ int nova_rpc_transport_call(nova_rpc_transport_t *t, int opt,
     if (!(opt & NOVA_RPC_T_BLOCK_MODE))
         return (int)n;
 
-    /* Ждём пробуждения этого конкретного слота (pthread_cond, не сигнал
-     * — см. комментарий в начале файла). */
+    /* Ждём пробуждения этого конкретного слота. ИСПРАВЛЕНО (найдено
+     * ThreadSanitizer, не гипотетически — см. комментарий в .h): проверка
+     * предиката и ожидание теперь выполняются под ТЕМ ЖЕ `pending_mutex`,
+     * которым `dispatch_reply()` защищает запись `state` — раньше тут
+     * использовался отдельный глобальный мьютекс, что было настоящей
+     * гонкой данных (CI run 43648070639, TSan). */
     {
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
@@ -240,16 +246,14 @@ int nova_rpc_transport_call(nova_rpc_transport_t *t, int opt,
             deadline.tv_nsec -= 1000000000L;
         }
 
-        pthread_mutex_lock(&g_cond_mutex);
+        pthread_mutex_lock(&t->pending_mutex);
         while (t->pending[slot].state == NOVA_RPC_PENDING_WAITING) {
-            int rc = pthread_cond_timedwait(&g_cond, &g_cond_mutex, &deadline);
+            int rc = pthread_cond_timedwait(&t->pending_cond, &t->pending_mutex, &deadline);
             if (rc == ETIMEDOUT)
                 break;
         }
-        pthread_mutex_unlock(&g_cond_mutex);
     }
 
-    pthread_mutex_lock(&t->pending_mutex);
     if (t->pending[slot].state == NOVA_RPC_PENDING_COMPLETED) {
         ret = (int)t->pending[slot].result_len;
         t->pending[slot].state = NOVA_RPC_PENDING_FREE;
@@ -340,11 +344,11 @@ int nova_rpc_transport_dispatch_reply(nova_rpc_transport_t *t,
         t->pending[slot].result_len = to_copy;
         t->pending[slot].state = NOVA_RPC_PENDING_COMPLETED;
     }
+    /* Broadcast под тем же pending_mutex, которым защищён предикат —
+     * тот же мьютекс, что ждущий поток держит в nova_rpc_transport_call()
+     * (см. комментарий там). Исключает гонку данных, найденную TSan. */
+    pthread_cond_broadcast(&t->pending_cond);
     pthread_mutex_unlock(&t->pending_mutex);
-
-    pthread_mutex_lock(&g_cond_mutex);
-    pthread_cond_broadcast(&g_cond);
-    pthread_mutex_unlock(&g_cond_mutex);
 
     return 0;
 }
@@ -368,7 +372,10 @@ void nova_rpc_transport_close(nova_rpc_transport_t *t)
     if (t->rfd_intr_video2 >= 0) close(t->rfd_intr_video2);
 
     if (t->opened)
+    {
         pthread_mutex_destroy(&t->pending_mutex);
+        pthread_cond_destroy(&t->pending_cond);
+    }
 
     memset(t, 0, sizeof(*t));
     t->fd_poll_audio = t->fd_intr_audio = -1;
