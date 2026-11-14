@@ -16,13 +16,24 @@ nova_vdec.o: nova-vdec/nova_vdec.c nova-vdec/nova_vdec.h
 nova_rpc.o: nova-rtk-rpc/nova_rpc.c nova-rtk-rpc/nova_rpc.h
 	$(CC) $(CFLAGS) -c nova-rtk-rpc/nova_rpc.c -o nova_rpc.o
 
-nova_vdec_diag.o: nova-decoder-diagnostics/nova_vdec_diag.c nova-vdec/nova_vdec.h
+nova_frame.o: nova-frame/nova_frame.c nova-frame/nova_frame.h
+	$(CC) $(CFLAGS) -Inova-frame -c nova-frame/nova_frame.c -o nova_frame.o
+
+nova_vdec_diag.o: nova-decoder-diagnostics/nova_vdec_diag.c nova-vdec/nova_vdec.h nova-rtk-rpc/nova_rpc.h
 	$(CC) $(CFLAGS) -c nova-decoder-diagnostics/nova_vdec_diag.c -o nova_vdec_diag.o
 
-nova_vdec_diag: nova_vdec.o nova_rpc.o nova_vdec_diag.o
-	$(CC) $(CFLAGS) -o nova_vdec_diag nova_vdec.o nova_rpc.o nova_vdec_diag.o
+nova_vdec_diag: nova_vdec.o nova_rpc.o nova_frame.o nova_vdec_diag.o
+	$(CC) $(CFLAGS) -o nova_vdec_diag nova_vdec.o nova_rpc.o nova_frame.o nova_vdec_diag.o
+
+# test_ioctl_abi собирается ТЕМ ЖЕ компилятором, что указан в CC (может быть
+# хостовым gcc в CI job "abi-mock-test" — см. nova-media-build.yml), не
+# обязательно кросс-тулчейном: макросы _IO/_IOW дают одинаковый результат на
+# всех архитектурах, использующих общий asm-generic/ioctl.h (ARM и x86_64—
+# да; sparc/alpha/powerpc исторически нет, но это не наша цель).
+test_ioctl_abi: tests/test_ioctl_abi.c
+	$(CC) $(CFLAGS) -o test_ioctl_abi tests/test_ioctl_abi.c
 
 clean:
-	rm -f *.o nova_vdec_diag
+	rm -f *.o nova_vdec_diag test_ioctl_abi
 
 .PHONY: all clean
