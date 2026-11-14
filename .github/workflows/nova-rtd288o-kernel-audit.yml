@@ -1,0 +1,87 @@
+name: nova-rtd288o-kernel-audit
+
+# Реальный, не фиктивный workflow: собирает именно найденное ядро rt2851mr под выбранный
+# defconfig. Если сборка не удастся — падает с настоящей ошибкой компиляции, лог сохраняется
+# как артефакт. Ничего не прошивается, никакое устройство не затрагивается.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  REPO: TCLOpenSource/rt2851mr
+  COMMIT: 80a2688976ac8f67b73ebfd5da5e55f3f09a472f
+  # Выбор обоснован в NOVA_KERNEL_BUILD_REPORT.md: ro.build.type устройства = "user" (подтверждено
+  # getprop), rtd288o_P.dts - наиболее вероятный вариант платы (HIGH CONFIDENCE, см.
+  # NOVA_DTS_COMPARISON.md). tv001 отброшен: он не встречается среди android.r-конфигов вообще.
+  DEFCONFIG: config.develop.android.r.rtd288o.tv030.emmc.user.andtv.optee.old_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone pinned commit (shallow, exact SHA)
+        run: |
+          git clone --no-checkout https://github.com/${{ env.REPO }}.git src
+          cd src
+          git fetch --depth 1 origin ${{ env.COMMIT }}
+          git checkout ${{ env.COMMIT }}
+          echo "Checked out commit:"
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "${{ env.COMMIT }}"
+
+      - name: Install ARM cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf bc bison flex libssl-dev libelf-dev
+          arm-linux-gnueabihf-gcc --version | tee compiler_version.txt
+
+      - name: Locate defconfig
+        run: |
+          find src/kernel/arch/arm/configs/realtek -iname "*${{ env.DEFCONFIG }}*"
+
+      - name: Generate .config
+        run: |
+          cd src/kernel
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+            arch/arm/configs/realtek/${{ env.DEFCONFIG }}
+          cp arch/arm/configs/realtek/${{ env.DEFCONFIG }} .config 2>/dev/null || true
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig || true
+          cp .config "$GITHUB_WORKSPACE/config.generated.txt"
+
+      - name: Build kernel (real attempt, no fake success)
+        run: |
+          cd src/kernel
+          set -o pipefail
+          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage 2>&1 \
+            | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Build DTBs
+        run: |
+          cd src/kernel
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+            arch/arm/boot/dts/rtd288o.dtb arch/arm/boot/dts/rtd288o_P.dtb \
+            arch/arm/boot/dts/rtd288o_Q.dtb 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+
+      - name: Collect artifacts (only what actually exists — no placeholder files)
+        if: always()
+        run: |
+          mkdir -p out
+          cp src/kernel/.config out/config.actual || true
+          cp src/kernel/arch/arm/boot/zImage out/ 2>/dev/null || echo "zImage: not produced" >> build_status.txt
+          cp src/kernel/arch/arm/boot/dts/rtd288o*.dtb out/ 2>/dev/null || echo "DTB: not produced" >> build_status.txt
+          cp src/kernel/System.map out/ 2>/dev/null || true
+          cp src/kernel/Module.symvers out/ 2>/dev/null || true
+          cp compiler_version.txt out/ || true
+          cp build.log out/ 2>/dev/null || true
+          cp build_status.txt out/ 2>/dev/null || true
+          echo "commit=${{ env.COMMIT }}" >> out/build_metadata.txt
+          echo "defconfig=${{ env.DEFCONFIG }}" >> out/build_metadata.txt
+          date -u >> out/build_metadata.txt
+
+      - name: Upload artifacts (always, even on failure — so the error is visible)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-rtd288o-build-${{ github.run_id }}
+          path: out/
+          retention-days: 14
