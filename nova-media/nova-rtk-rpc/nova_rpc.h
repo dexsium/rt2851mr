@@ -26,6 +26,10 @@
 
 #include <stdint.h>
 
+/* Control-узел, который сам создаёт драйвер ядра (RPCDriver.c:648,
+ * device_create(..., MKDEV(rpc_major, 100), ..., "rpc100")). */
+#define NOVA_RPC_DEVICE_NODE "/dev/rpc100"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
