@@ -29,6 +29,15 @@
 extern "C" {
 #endif
 
+/* ===================== Program/Version ID (CONFIRMED, не диапазон) =====================
+ * VideoRPC_System.h:22-23 и VideoRPC_Agent.h:22-23 — точные #define, не
+ * предположение по диапазону из readme.txt (та таблица описывает диапазон
+ * ПРОЦЕДУРНЫХ id внутри отдела, не programID самой RPC-программы). */
+#define NOVA_RPC_PROGRAM_VIDEO_SYSTEM 100  /* VideoRPC_System.h:22 — ToAgent (мы вызываем AVCPU) */
+#define NOVA_RPC_PROGRAM_VIDEO_AGENT  300  /* VideoRPC_Agent.h:22 — ToSystem (AVCPU вызывает нас, мы — сервер) */
+#define NOVA_RPC_VERSION_VIDEO        0    /* VideoRPC_System.h:23 / VideoRPC_Agent.h:23 */
+#define NOVA_RPC_REPLYID             99    /* RPCstruct.h:19 — programID/versionID сентинел для ответов */
+
 /* ===================== ToAgent: ARM → AVCPU (управление) =====================
  * VideoRPC_System.h, строки 28-109 (участок, реально процитированный в
  * этой сессии — файл длиннее, не весь продублирован здесь). */
