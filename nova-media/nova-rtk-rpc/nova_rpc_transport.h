@@ -112,6 +112,17 @@ typedef struct nova_rpc_transport {
 
     nova_rpc_pending_t pending[NOVA_RPC_T_MAX_PENDING];
     pthread_mutex_t pending_mutex;
+    /* ВАЖНО (найдено ThreadSanitizer, не гипотетически): условная
+     * переменная ожидания ответа ОБЯЗАНА использовать ТОТ ЖЕ мьютекс, что
+     * защищает проверяемый предикат (`pending[i].state`), иначе чтение
+     * `state` в цикле ожидания происходит без удержания `pending_mutex` —
+     * настоящая гонка данных (TSan: `nova_rpc_transport.c:244` читает
+     * `state` без `pending_mutex`, пока `dispatch_reply()` пишет его под
+     * `pending_mutex`, CI run 43648070639). Раньше здесь использовался
+     * общий ГЛОБАЛЬНЫЙ `pthread_cond_t` с ОТДЕЛЬНЫМ глобальным мьютексом
+     * — исправлено: теперь cond var принадлежит самому транспорту и
+     * всегда используется вместе именно с `pending_mutex`. */
+    pthread_cond_t pending_cond;
 } nova_rpc_transport_t;
 
 /* Позволяет override путей device-нод для mock/e2e-тестов (CI без
