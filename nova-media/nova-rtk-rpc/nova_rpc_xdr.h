@@ -37,6 +37,19 @@ extern "C" {
 /* Размер struct RPC_STRUCT на проводе (28 байт, 7 x u32 big-endian). */
 #define NOVA_RPC_STRUCT_WIRE_SIZE 28
 
+/* Статическая проверка (ТЗ §7): независимо от ABI компилятора/архитектуры
+ * (ARM32 с 4-байтным `long`, ARM64/x86_64 с 8-байтным `long`), проводное
+ * представление RPC_STRUCT фиксировано — 7 полей по 4 байта. Этот размер
+ * не зависит от sizeof(long) на целевой платформе: кодек работает с
+ * uint32_t, не с native `long`, именно чтобы исключить эту зависимость
+ * (прямое требование ТЗ "не используй напрямую ABI ARM32"/"отсутствие
+ * зависимости от размера long"). */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#include <assert.h>
+_Static_assert(NOVA_RPC_STRUCT_WIRE_SIZE == 7 * 4,
+               "NOVA_RPC_STRUCT_WIRE_SIZE must stay 7 big-endian u32 fields (28 bytes)");
+#endif
+
 typedef struct nova_rpc_struct {
     uint32_t program_id;
     uint32_t version_id;
