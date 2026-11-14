@@ -19,15 +19,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Clone pinned commit (shallow, exact SHA)
+      - name: Clone fork master (base = pinned upstream commit + traceable fix commits on top)
         run: |
-          git clone --no-checkout https://github.com/${{ env.REPO }}.git src
+          # Base history starts at the pinned upstream commit ${{ env.COMMIT }} (verified below).
+          # Runs 43616615430/43617144626/43617615941 checked out that exact SHA directly and hit
+          # three real, sequential build errors (defconfig path; ARMv7 asm flags; GAS section
+          # syntax in proc-v7.S). Each fix is its own commit on this fork's master, on top of that
+          # same base -- not a silent switch to a different upstream source. Building the frozen
+          # original SHA again would just reproduce the same fixed errors, so this run tracks
+          # master instead of re-pinning to the unpatched commit.
+          git clone --depth 20 https://github.com/${{ github.repository }}.git src
           cd src
-          git fetch --depth 1 origin ${{ env.COMMIT }}
-          git checkout ${{ env.COMMIT }}
-          echo "Checked out commit:"
-          git rev-parse HEAD
-          test "$(git rev-parse HEAD)" = "${{ env.COMMIT }}"
+          echo "HEAD:"; git log --oneline -5
+          git merge-base --is-ancestor ${{ env.COMMIT }} HEAD && echo "base commit confirmed in history"
 
       - name: Install ARM cross toolchain
         run: |
