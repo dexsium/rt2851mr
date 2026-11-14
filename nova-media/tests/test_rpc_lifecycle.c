@@ -9,10 +9,31 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+/* См. идентичный комментарий в test_rpc_concurrency.c — найден реальным
+ * многочасовым зависанием CI, не гипотетический. */
+static void watchdog_handler(int sig)
+{
+    (void)sig;
+    const char msg[] = "\nFAIL watchdog: test exceeded wall-clock budget, aborting (likely deadlock)\n";
+    write(2, msg, sizeof(msg) - 1);
+    _exit(97);
+}
+
+static void install_watchdog(unsigned seconds)
+{
+    struct sigaction sa;
+    sa.sa_handler = watchdog_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(seconds);
+}
 #include <unistd.h>
 
 #include "../nova-rtk-rpc/nova_rpc_protocol.h"
@@ -120,6 +141,7 @@ int main(void)
     struct open_thread_args oa;
     int ret;
 
+    install_watchdog(30);
     snprintf(dir, sizeof(dir), "/tmp/nova_rpc_lifecycle_%d", (int)getpid());
     mkdir(dir, 0700);
     setup_fifos(dir);
