@@ -22,6 +22,9 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h> /* atomic_int для stop-флагов — найдено TSan: volatile int
+                          не гарантирует атомарность, только отсутствие
+                          оптимизации компилятором (CI run 43648589773). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +69,7 @@ static void mkpath(char *out, const char *name)
 
 /* read(), но с поллингом шагами POLL_STEP_MS, чтобы периодически можно
  * было проверить `stop`. Возвращает то же, что read(), либо 0 при stop. */
-static ssize_t poll_read(int fd, void *buf, size_t cap, const volatile int *stop)
+static ssize_t poll_read(int fd, void *buf, size_t cap, const atomic_int *stop)
 {
     while (!*stop) {
         struct pollfd pfd = { fd, POLLIN, 0 };
@@ -83,7 +86,7 @@ struct echo_server_args {
     char w_path[256];
     char r_path[256];
     uint32_t fake_result;
-    volatile int *stop;
+    atomic_int *stop;
 };
 
 static void *echo_server_thread(void *arg)
@@ -140,7 +143,7 @@ static void *echo_server_thread(void *arg)
 struct dispatch_loop_args {
     nova_rpc_transport_t *t;
     int rfd;
-    volatile int *stop;
+    atomic_int *stop;
 };
 
 static void *dispatch_loop_thread(void *arg)
@@ -158,7 +161,7 @@ static void *dispatch_loop_thread(void *arg)
 
 struct drain_args {
     char **paths; /* 10 путей: первые 5 — write-тип (открыть RDONLY), следующие 5 — read-тип (открыть WRONLY) */
-    volatile int *stop;
+    atomic_int *stop;
 };
 
 static void *drain_thread(void *arg)
@@ -189,7 +192,7 @@ int main(void)
 {
     nova_rpc_transport_t t;
     pthread_t srv, disp, drain;
-    volatile int stop = 0;
+    atomic_int stop = 0;
     struct echo_server_args srv_args;
     struct dispatch_loop_args disp_args;
     struct drain_args drain_args_v;
