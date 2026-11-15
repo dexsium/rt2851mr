@@ -398,11 +398,21 @@ int main(void)
         free(data);
         nova_rpc_callbacks_destroy(&ctx_life);
 
-        CHECK("lifetime: user_data оставался валиден внутри handler всё время выполнения",
-              g_lifetime_user_data_ok);
-        CHECK("lifetime: unregister() из другого потока НЕ вернулся раньше, чем handler "
-              "закончил использовать user_data (инвариант порядка, не угадан по времени)",
-              uargs.finished_before_return == 1);
+        if (!g_lifetime_user_data_ok) {
+            printf("FAIL lifetime: user_data не был валиден внутри handler\n");
+            failures++;
+        } else {
+            printf("ok   lifetime: user_data оставался валиден внутри handler всё время выполнения\n");
+        }
+        if (uargs.finished_before_return != 1) {
+            printf("FAIL lifetime: unregister() вернулся РАНЬШЕ, чем handler закончил "
+                   "использовать user_data (нарушение инварианта порядка)\n");
+            failures++;
+        } else {
+            printf("ok   lifetime: unregister() из другого потока не вернулся раньше, чем "
+                   "handler закончил использовать user_data (инвариант порядка, не угадан "
+                   "по времени)\n");
+        }
     }
 
     /* --- Стресс-тест (ТЗ §4.3/§8: "минимум 8 потоков", "не ограничиваться
