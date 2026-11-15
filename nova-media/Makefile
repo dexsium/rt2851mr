@@ -82,6 +82,17 @@ test_rpc_fault_injection: tests/test_rpc_fault_injection.c nova_rpc_transport.o 
 bench_rpc_transport: tests/bench_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o
 	$(CC) $(CFLAGS) -o bench_rpc_transport tests/bench_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
+# ТЗ "Realtek VDEC/VO & GStreamer": nova-player собирается ТОЛЬКО для
+# x86_64 (native gcc, не CROSS_COMPILE) — кросс-toolchain для ARM32/ARM64
+# не несёт GStreamer dev-пакетов в этой CI-среде, честно не притворяемся,
+# что это ARM-сборка.
+GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 2>/dev/null)
+GST_LIBS := $(shell pkg-config --libs gstreamer-1.0 2>/dev/null)
+
+test_nova_player: tests/test_nova_player.c nova-player/nova_player.c nova-player/nova_player.h nova-player/nova_media_events.h
+	gcc -Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-player $(GST_CFLAGS) \
+	    -o test_nova_player tests/test_nova_player.c nova-player/nova_player.c $(GST_LIBS) -lpthread
+
 MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
              test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e \
              test_rpc_concurrency test_rpc_lifecycle test_rpc_fault_injection
@@ -89,6 +100,6 @@ MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
 mock-tests: $(MOCK_TESTS)
 
 clean:
-	rm -f *.o nova_vdec_diag $(MOCK_TESTS) bench_rpc_transport
+	rm -f *.o nova_vdec_diag $(MOCK_TESTS) bench_rpc_transport test_nova_player
 
 .PHONY: all clean mock-tests
