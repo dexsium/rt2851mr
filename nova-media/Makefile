@@ -79,6 +79,9 @@ test_rpc_lifecycle: tests/test_rpc_lifecycle.c nova_rpc_transport.o nova_rpc_xdr
 test_rpc_fault_injection: tests/test_rpc_fault_injection.c nova_rpc_transport.o nova_rpc_xdr.o
 	$(CC) $(CFLAGS) -o test_rpc_fault_injection tests/test_rpc_fault_injection.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
 
+bench_rpc_transport: tests/bench_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o
+	$(CC) $(CFLAGS) -o bench_rpc_transport tests/bench_rpc_transport.c nova_rpc_transport.o nova_rpc_xdr.o $(LDLIBS)
+
 MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
              test_rpc_transport test_video_rpc test_vo_rpc test_rpc_e2e \
              test_rpc_concurrency test_rpc_lifecycle test_rpc_fault_injection
@@ -86,6 +89,6 @@ MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
 mock-tests: $(MOCK_TESTS)
 
 clean:
-	rm -f *.o nova_vdec_diag $(MOCK_TESTS)
+	rm -f *.o nova_vdec_diag $(MOCK_TESTS) bench_rpc_transport
 
 .PHONY: all clean mock-tests
