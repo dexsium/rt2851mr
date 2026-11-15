@@ -220,6 +220,11 @@ int main(void)
     struct open_thread_args oa;
     int ret;
 
+    /* Построчная буферизация stdout — иначе watchdog'овский _exit(97) (не
+     * flush'ит stdio-буферы, в отличие от обычного return/exit()) теряет
+     * ВСЕ уже напечатанные "ok"-строки, и диагностика "где именно висим"
+     * становится невозможной по логам CI. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
     install_watchdog(30);
     snprintf(dir, sizeof(dir), "/tmp/nova_rpc_lifecycle_%d", (int)getpid());
     mkdir(dir, 0700);
