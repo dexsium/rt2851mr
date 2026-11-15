@@ -209,13 +209,14 @@ jobs:
           make test_nova_player
           STATUS=0
           echo "=== test_nova_player ===" | tee -a ../nova-player-report.txt
-          # ДИАГНОСТИКА: GStreamer по умолчанию ставит свой собственный
-          # SIGSEGV-обработчик ("красивые" бэктрейсы) — он может перехватить
-          # сигнал ПЕРЕД ASan, из-за чего крэш происходит без отчёта ASan
-          # (наблюдалось: exit=139, SIGSEGV, НИ ОДНОЙ строки от AddressSanitizer).
-          # GST_DISABLE_SEGTRAP=1 отключает обработчик GStreamer, оставляя
-          # сигнал ASan.
-          GST_DISABLE_SEGTRAP=1 ASAN_OPTIONS=abort_on_error=0:handle_segv=1 \
+          # NOVA_PLAYER_HEADLESS=1: nova_player использует fakesink для
+          # видео/аудио вместо autovideosink/autoaudiosink — НАЙДЕНО
+          # реальным heap-buffer-overflow в стороннем libgstdirectfb.so,
+          # которое autovideosink выбирал по умолчанию в этом безголовом
+          # контейнере (нет X11/Wayland) — см. отчёт, не баг nova_player.
+          # GST_DISABLE_SEGTRAP=1 отключает собственный SIGSEGV-обработчик
+          # GStreamer, чтобы в случае падения ASan мог дать полный отчёт.
+          NOVA_PLAYER_HEADLESS=1 GST_DISABLE_SEGTRAP=1 \
               ./test_nova_player 2>&1 | tee -a ../nova-player-report.txt
           rc=${PIPESTATUS[0]}
           echo "exit=$rc" | tee -a ../nova-player-report.txt
