@@ -140,6 +140,37 @@ static void *waiter_fn(void *arg)
     return NULL;
 }
 
+/* ТЗ "RPC Transport Complete Closure" п.10: close() одновременно с ЖИВЫМ
+ * dispatch_reply() (не последовательно, как в предыдущих этапах — здесь
+ * dispatch_reply() вызывается в тесном цикле ДРУГИМ потоком, пока main
+ * вызывает close()). Сообщения заведомо не совпадут ни с одним pending
+ * (таблица пуста) — это нормально, цель теста не "доставить ответ", а
+ * доказать отсутствие use-after-destroy между close() и dispatch_reply(),
+ * защищённое g_close_guard (см. nova_rpc_transport.c). */
+struct dispatch_loop_args {
+    nova_rpc_transport_t *t;
+    atomic_int *stop;
+    atomic_int calls;
+};
+
+static void *dispatch_loop_fn(void *arg)
+{
+    struct dispatch_loop_args *a = (struct dispatch_loop_args *)arg;
+    while (!atomic_load(a->stop)) {
+        uint8_t msg[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        nova_rpc_struct_t h;
+        h.program_id = NOVA_RPC_REPLYID; h.version_id = NOVA_RPC_REPLYID;
+        h.procedure_id = 0; h.task_id = 0; h.sys_pid = 0; h.parameter_size = 8;
+        h.context = 0;
+        nova_rpc_xdr_encode_struct(msg, sizeof(msg), &h);
+        nova_rpc_xdr_put_u32(msg + NOVA_RPC_STRUCT_WIRE_SIZE, 0);
+        nova_rpc_xdr_put_u32(msg + NOVA_RPC_STRUCT_WIRE_SIZE + 4, 0);
+        nova_rpc_transport_dispatch_reply(a->t, msg, sizeof(msg));
+        atomic_fetch_add(&a->calls, 1);
+    }
+    return NULL;
+}
+
 /* ТЗ "RPC Transport Complete Closure" п.8: close() во время NONBLOCK_MODE
  * RPC. В отличие от BLOCK_MODE, nonblock-вызов не ждёт ответа — пишет и
  * сразу возвращается, но ОБА режима одинаково регистрируются как
@@ -273,6 +304,35 @@ int main(void)
             pthread_join(closers[ci], NULL);
         CHECK("4 конкурентных close() на одном транспорте не привели к крашу/UB "
               "(под ASan/TSan — иначе job сам бы упал)", 1);
+    }
+
+    /* --- ТЗ "RPC Transport Complete Closure" п.10: close() одновременно с
+     * ЖИВЫМ dispatch_reply() (не последовательно). */
+    {
+        pthread_t opener4, dr_thread;
+        struct dispatch_loop_args dla;
+        atomic_int dr_stop = 0;
+
+        pthread_create(&opener4, NULL, peer_opener_thread, &oa);
+        ret = nova_rpc_transport_open(&t);
+        pthread_join(opener4, NULL);
+        CHECK("Открытие перед тестом close() vs живой dispatch_reply() успешно", ret == 0);
+
+        dla.t = &t;
+        dla.stop = &dr_stop;
+        atomic_store(&dla.calls, 0);
+        pthread_create(&dr_thread, NULL, dispatch_loop_fn, &dla);
+
+        /* Детерминированный барьер: ждём, пока dispatch_reply() реально
+         * выполнится хотя бы раз, прежде чем звать close() параллельно. */
+        while (atomic_load(&dla.calls) == 0)
+            ;
+
+        nova_rpc_transport_close(&t); /* гонка close() vs живой цикл dispatch_reply() */
+        atomic_store(&dr_stop, 1);
+        pthread_join(dr_thread, NULL);
+        CHECK("close() конкурентно с живым циклом dispatch_reply() безопасен "
+              "(нет use-after-destroy — иначе ASan/TSan job упал бы сам)", 1);
     }
 
     /* --- ТЗ "RPC Transport Complete Closure" п.8: close() во время
