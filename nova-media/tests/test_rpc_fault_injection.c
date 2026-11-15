@@ -159,6 +159,7 @@ int main(void)
 {
     char dir[256];
 
+    setvbuf(stdout, NULL, _IOLBF, 0); /* см. комментарий в test_rpc_lifecycle.c */
     install_watchdog(30);
     snprintf(dir, sizeof(dir), "/tmp/nova_rpc_fi_%d", (int)getpid());
     mkdir(dir, 0700);
