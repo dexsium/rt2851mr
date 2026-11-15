@@ -4,13 +4,38 @@
  * сообщений, не реальный AVCPU). */
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "../nova-rtk-rpc/nova_rpc_callbacks.h"
 #include "../nova-rtk-rpc/nova_rpc_protocol.h"
+
+/* См. идентичный комментарий в test_rpc_concurrency.c/test_rpc_lifecycle.c —
+ * найден реальным многочасовым зависанием CI в прошлых этапах, не
+ * гипотетический. Добавлен сюда в этом этапе на случай, если исправление
+ * self-unregister (ниже) окажется неполным — превращает скрытый deadlock
+ * в быстрый явный провал, а не в зависший job. */
+static void watchdog_handler(int sig)
+{
+    (void)sig;
+    const char msg[] = "\nFAIL watchdog: test exceeded 15s wall-clock budget, aborting (likely deadlock)\n";
+    write(2, msg, sizeof(msg) - 1);
+    _exit(97);
+}
+
+static void install_watchdog(unsigned seconds)
+{
+    struct sigaction sa;
+    sa.sa_handler = watchdog_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(seconds);
+}
 
 static int g_frame_info_calls = 0;
 static int g_last_payload_size = -1;
@@ -24,6 +49,23 @@ static void on_frame_info(const nova_rpc_struct_t *hdr, const uint8_t *payload,
     g_frame_info_calls++;
     g_last_payload_size = (int)payload_size;
     g_last_user_data = user_data;
+}
+
+/* --- ТЗ "RPC Transport Complete Closure" §4.1: self-unregister — callback
+ * удаляет САМ СЕБЯ. Наивная реализация unregister() ("ждать busy==0")
+ * здесь зависла бы навечно (busy может стать 0 только ПОСЛЕ возврата из
+ * этого самого handler) — исправлено в nova_rpc_callbacks.c через
+ * сравнение busy_thread с pthread_self(). */
+static nova_rpc_callback_ctx_t *g_self_unreg_ctx;
+static int g_self_unreg_handle = -1;
+static int g_self_unreg_calls;
+
+static void self_unregistering_handler(const nova_rpc_struct_t *hdr, const uint8_t *payload,
+                                        size_t payload_size, void *user_data)
+{
+    (void)hdr; (void)payload; (void)payload_size; (void)user_data;
+    g_self_unreg_calls++;
+    nova_rpc_callbacks_unregister(g_self_unreg_ctx, g_self_unreg_handle);
 }
 
 /* --- Для теста рекурсивного dispatch()/register() из handler (ТЗ §8) --- */
@@ -126,6 +168,7 @@ int main(void)
     int failures = 0;
     int marker = 42;
 
+    install_watchdog(15);
     nova_rpc_callbacks_init(&ctx);
 
     handle = nova_rpc_callbacks_register(&ctx, NOVA_RPC_PROGRAM_VIDEO_AGENT,
@@ -173,6 +216,40 @@ int main(void)
     }
 
     nova_rpc_callbacks_destroy(&ctx);
+
+    /* --- ТЗ "RPC Transport Complete Closure" §4.1: self-unregister. --- */
+    {
+        nova_rpc_callback_ctx_t ctx_self;
+        uint8_t self_msg[NOVA_RPC_STRUCT_WIRE_SIZE];
+
+        nova_rpc_callbacks_init(&ctx_self);
+        g_self_unreg_ctx = &ctx_self;
+        g_self_unreg_calls = 0;
+        g_self_unreg_handle = nova_rpc_callbacks_register(&ctx_self, 7, 0,
+                                                            self_unregistering_handler, NULL);
+
+        build_message(self_msg, sizeof(self_msg), 7, 0, 0, 0);
+        if (nova_rpc_callbacks_dispatch(&ctx_self, self_msg, sizeof(self_msg)) != 0 ||
+            g_self_unreg_calls != 1) {
+            printf("FAIL self-unregister deadlocked or did not run\n");
+            failures++;
+        } else {
+            printf("ok   callback self-unregister (вызывает unregister() на самого себя) "
+                   "завершается без deadlock\n");
+        }
+
+        /* После self-unregister повторный dispatch на тот же program_id
+         * не должен найти обработчик (он реально удалён, не просто
+         * "забыл" вызваться). */
+        if (nova_rpc_callbacks_dispatch(&ctx_self, self_msg, sizeof(self_msg)) != -ENOMSG) {
+            printf("FAIL self-unregistered handler still matches after self-unregister\n");
+            failures++;
+        } else {
+            printf("ok   после self-unregister обработчик действительно удалён (-ENOMSG)\n");
+        }
+
+        nova_rpc_callbacks_destroy(&ctx_self);
+    }
 
     /* --- ТЗ §8: рекурсивный dispatch() и повторная регистрация ИЗ
      * callback — раньше (dispatch() вызывал handler ПОД ctx->mutex)
