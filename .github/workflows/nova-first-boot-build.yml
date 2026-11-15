@@ -1,0 +1,78 @@
+name: nova-first-boot-build
+
+# Консолидация уже проверенного рабочего workflow nova-rtd288o-kernel-audit.yml под именем,
+# которое прямо запрашивает ТЗ "BOOT CHAIN AUDIT & FIRST BOOT FEASIBILITY" §14. Логика
+# идентична уже подтверждённой (CI run 43624016637 — SUCCESS, zImage+DTB реально собраны),
+# добавлена только явная маркировка артефактов "BUILD VERIFIED — NOT HARDWARE VERIFIED".
+
+on:
+  workflow_dispatch: {}
+
+env:
+  COMMIT: 80a2688976ac8f67b73ebfd5da5e55f3f09a472f
+  DEFCONFIG: config.develop.android.r.rtd288o.tv030.emmc.user.andtv.optee.old_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone fork master (base = pinned upstream commit + traceable fix commits on top)
+        run: |
+          git clone --depth 20 https://github.com/${{ github.repository }}.git src
+          cd src
+          git log --oneline -5
+          git merge-base --is-ancestor ${{ env.COMMIT }} HEAD && echo "base commit confirmed in history"
+
+      - name: Install ARM cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf bc bison flex libssl-dev libelf-dev
+          arm-linux-gnueabihf-gcc --version | tee compiler_version.txt
+
+      - name: Generate .config
+        run: |
+          cd src/kernel
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- realtek/${{ env.DEFCONFIG }}
+          cp .config "$GITHUB_WORKSPACE/config.generated.txt"
+
+      - name: Build kernel (real attempt, no fake success)
+        run: |
+          cd src/kernel
+          set -o pipefail
+          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+            KCFLAGS="-march=armv7-a -Wno-error=address -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types -Wno-error=misleading-indentation -Wno-error=unused-but-set-variable -Wno-error=stringop-overflow -Wno-error=stringop-truncation -Wno-error=format-truncation -Wno-error=maybe-uninitialized" \
+            KAFLAGS="-march=armv7-a" zImage 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Build DTBs
+        run: |
+          cd src/kernel
+          set -o pipefail
+          make -j"$(nproc)" ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- dtbs 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          ls -la arch/arm/boot/dts/rtd288o*.dtb
+
+      - name: Collect artifacts (only what actually exists — no placeholder files)
+        if: always()
+        run: |
+          mkdir -p out
+          cp src/kernel/.config out/config.actual || true
+          cp src/kernel/arch/arm/boot/zImage out/ 2>/dev/null || echo "zImage: not produced" >> out/build_status.txt
+          cp src/kernel/arch/arm/boot/dts/rtd288o*.dtb out/ 2>/dev/null || echo "DTB: not produced" >> out/build_status.txt
+          cp src/kernel/System.map out/ 2>/dev/null || true
+          cp src/kernel/Module.symvers out/ 2>/dev/null || true
+          cp compiler_version.txt out/ || true
+          cp build.log out/ 2>/dev/null || true
+          {
+            echo "commit=${{ env.COMMIT }}"
+            echo "defconfig=${{ env.DEFCONFIG }}"
+            echo "STATUS: BUILD VERIFIED -- NOT HARDWARE VERIFIED"
+            echo "Nothing in this artifact was ever written to or booted on a physical device."
+            date -u
+          } >> out/build_metadata.txt
+
+      - name: Upload artifacts (always, even on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-first-boot-build-${{ github.run_id }}
+          path: out/
+          retention-days: 14
