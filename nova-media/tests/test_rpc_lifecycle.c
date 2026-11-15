@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,35 @@ static void *waiter_fn(void *arg)
     return NULL;
 }
 
+/* ТЗ "RPC Transport Complete Closure" п.8: close() во время NONBLOCK_MODE
+ * RPC. В отличие от BLOCK_MODE, nonblock-вызов не ждёт ответа — пишет и
+ * сразу возвращается, но ОБА режима одинаково регистрируются как
+ * `waiters` (см. nova_rpc_transport_call()) ДО того, как коснутся
+ * send_mutex/fd, поэтому close() обязан так же безопасно ждать их
+ * завершения. */
+struct nonblock_loop_args {
+    nova_rpc_transport_t *t;
+    atomic_int *stop;
+    atomic_int successes;
+};
+
+static void *nonblock_loop_fn(void *arg)
+{
+    struct nonblock_loop_args *a = (struct nonblock_loop_args *)arg;
+    while (!atomic_load(a->stop)) {
+        uint8_t args[4] = {0};
+        int rc = nova_rpc_transport_call(a->t,
+                                          NOVA_RPC_T_NONBLOCK_MODE | NOVA_RPC_T_USE_POLL_BUF | NOVA_RPC_T_SEND_VIDEO_CPU,
+                                          NOVA_RPC_PROGRAM_VIDEO_SYSTEM, NOVA_RPC_VERSION_VIDEO,
+                                          1, args, sizeof(args), NULL, 0, 0);
+        if (rc >= 0)
+            atomic_fetch_add(&a->successes, 1);
+        else if (rc == -ESHUTDOWN || rc == -ENODEV)
+            break; /* транспорт закрывается/закрыт — честно останавливаемся, не крутимся впустую */
+    }
+    return NULL;
+}
+
 int main(void)
 {
     char dir[256];
@@ -243,6 +273,53 @@ int main(void)
             pthread_join(closers[ci], NULL);
         CHECK("4 конкурентных close() на одном транспорте не привели к крашу/UB "
               "(под ASan/TSan — иначе job сам бы упал)", 1);
+    }
+
+    /* --- ТЗ "RPC Transport Complete Closure" п.8: close() во время
+     * NONBLOCK_MODE RPC. Поток непрерывно отправляет nonblock-запросы;
+     * главный поток ждёт (детерминированно, без usleep) первого
+     * реального успеха, затем вызывает close() конкурентно с ещё
+     * работающим циклом отправки. */
+    {
+        pthread_t opener3, nb_thread;
+        struct nonblock_loop_args nba;
+        atomic_int nb_stop = 0;
+
+        pthread_create(&opener3, NULL, peer_opener_thread, &oa);
+        ret = nova_rpc_transport_open(&t);
+        pthread_join(opener3, NULL);
+        CHECK("Открытие перед тестом close() vs NONBLOCK_MODE успешно", ret == 0);
+
+        nba.t = &t;
+        nba.stop = &nb_stop;
+        atomic_store(&nba.successes, 0);
+        pthread_create(&nb_thread, NULL, nonblock_loop_fn, &nba);
+
+        /* Детерминированный барьер: ждём первого РЕАЛЬНОГО успешного
+         * nonblock-отправления (не предположение по времени). */
+        while (atomic_load(&nba.successes) == 0)
+            ;
+
+        nova_rpc_transport_close(&t); /* гонка close() vs цикл NONBLOCK_MODE-отправок */
+        atomic_store(&nb_stop, 1);
+        pthread_join(nb_thread, NULL);
+        CHECK("close() конкурентно с непрерывными NONBLOCK_MODE-отправками безопасен "
+              "(нет use-after-destroy/UB — иначе ASan/TSan job упал бы сам)", 1);
+        CHECK("хотя бы один nonblock-вызов успел пройти ДО close()",
+              atomic_load(&nba.successes) > 0);
+
+        /* После close() транспорт гарантированно НЕ открыт — свежий
+         * nonblock-вызов на НЕМ ЖЕ должен честно вернуть -ENODEV, не
+         * писать в уже закрытые fd. */
+        {
+            uint8_t args[4] = {0};
+            int rc_after = nova_rpc_transport_call(&t,
+                NOVA_RPC_T_NONBLOCK_MODE | NOVA_RPC_T_USE_POLL_BUF | NOVA_RPC_T_SEND_VIDEO_CPU,
+                NOVA_RPC_PROGRAM_VIDEO_SYSTEM, NOVA_RPC_VERSION_VIDEO,
+                1, args, sizeof(args), NULL, 0, 0);
+            CHECK("NONBLOCK_MODE-вызов на уже закрытом транспорте честно возвращает -ENODEV",
+                  rc_after == -ENODEV);
+        }
     }
 
     /* --- Финальное открытие для проверки на утечки fd и чистого выхода --- */
