@@ -242,6 +242,32 @@ static void *client_thread(void *arg)
     return NULL;
 }
 
+struct aba_call_args {
+    nova_rpc_transport_t *t;
+    uint32_t value;
+    int timeout_ms;
+    int rc;
+    uint32_t got_value;
+};
+
+/* Как client_thread, но с настраиваемым timeout_ms и сохраняет
+ * полученное значение для проверки (ТЗ §4.1 — прямой adversarial
+ * ABA-тест). */
+static void *aba_call_thread(void *arg)
+{
+    struct aba_call_args *c = (struct aba_call_args *)arg;
+    uint8_t args[4], result[4];
+
+    nova_rpc_xdr_put_u32(args, c->value);
+    memset(result, 0, sizeof(result));
+    c->rc = nova_rpc_transport_call(c->t,
+                                     NOVA_RPC_T_BLOCK_MODE | NOVA_RPC_T_USE_POLL_BUF | NOVA_RPC_T_SEND_VIDEO_CPU,
+                                     NOVA_RPC_PROGRAM_VIDEO_SYSTEM, NOVA_RPC_VERSION_VIDEO,
+                                     42, args, sizeof(args), result, sizeof(result), c->timeout_ms);
+    c->got_value = nova_rpc_xdr_get_u32(result);
+    return NULL;
+}
+
 /* Запускает N конкурентных клиентов против транспорта `t` с заданным
  * порядком ответов сервера. Возвращает число клиентов, получивших
  * СВОЁ (не чужое и не поддельное) значение обратно. */
@@ -446,6 +472,127 @@ int main(void)
      * и FIFO очищена от непрочитанных старых запросов (см. выше). */
     CHECK("Повторный запрос после освобождения слотов снова проходит успешно",
           run_n_concurrent(&t, 2, ORDER_FORWARD, server_wfd, server_rfd) == 2);
+
+    /* --- ТЗ "RPC Transport Hardening" §4.1: прямой adversarial ABA-тест.
+     * Таблица pending[] сейчас снова пуста (предыдущая проверка её
+     * освободила) — следующая аллокация пойдёт с индекса 0. */
+    {
+        struct aba_call_args a_args, b_args;
+        pthread_t a_thread, b_thread;
+        uint8_t snif[64];
+        nova_rpc_struct_t a_hdr, b_hdr;
+        ssize_t n;
+        uint8_t stale_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        uint8_t good_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        nova_rpc_struct_t reply_hdr;
+
+        /* 1. Запрос A занимает слот (никто не отвечает -> тайм-аут). */
+        a_args.t = &t; a_args.value = 0xAAAA0000; a_args.timeout_ms = 200;
+        pthread_create(&a_thread, NULL, aba_call_thread, &a_args);
+
+        /* Перехватываем РЕАЛЬНЫЕ байты запроса A прямо с провода
+         * (server_wfd) — честно получаем его настоящий context, не
+         * угадываем. */
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("ABA: удалось перехватить реальный запрос A с провода", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &a_hdr);
+
+        /* 2. Запрос A завершается по тайм-ауту. 3. Слот освобождается. */
+        pthread_join(a_thread, NULL);
+        CHECK("ABA: запрос A честно завершился по тайм-ауту (слот освобождён)",
+              a_args.rc == -ETIMEDOUT);
+
+        /* 4. Запрос B занимает ТОТ ЖЕ слот с новым generation. */
+        b_args.t = &t; b_args.value = 0xBBBB0000; b_args.timeout_ms = 3000;
+        pthread_create(&b_thread, NULL, aba_call_thread, &b_args);
+
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("ABA: удалось перехватить реальный запрос B с провода", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &b_hdr);
+
+        CHECK("ABA: B действительно переиспользовал тот же индекс слота, что и A",
+              (b_hdr.context & NOVA_RPC_T_SLOT_MASK) == (a_hdr.context & NOVA_RPC_T_SLOT_MASK));
+        CHECK("ABA: B получил НОВОЕ значение generation, отличное от A",
+              (b_hdr.context >> NOVA_RPC_T_SLOT_BITS) != (a_hdr.context >> NOVA_RPC_T_SLOT_BITS));
+
+        /* 5. Mock-сервер отправляет ЗАПОЗДАВШИЙ ответ A (старый context). */
+        reply_hdr.program_id = NOVA_RPC_REPLYID;
+        reply_hdr.version_id = NOVA_RPC_REPLYID;
+        reply_hdr.procedure_id = 0;
+        reply_hdr.task_id = 0;
+        reply_hdr.sys_pid = 0;
+        reply_hdr.parameter_size = 8;
+        reply_hdr.context = a_hdr.context; /* СТАРЫЙ (A) context/generation */
+        nova_rpc_xdr_encode_struct(stale_reply, sizeof(stale_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(stale_reply + NOVA_RPC_STRUCT_WIRE_SIZE, a_hdr.task_id);
+        /* "Чужое" значение — если ABA-защита сломана, оно попадёт в B. */
+        nova_rpc_xdr_put_u32(stale_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, 0xDEADBEEF);
+        write(server_rfd, stale_reply, sizeof(stale_reply));
+
+        /* 6/7. Даём dispatch_thread время обработать (и честно отбросить,
+         * -ESTALE внутри dispatch_reply) запоздавший ответ, не трогая
+         * буфер результата B. */
+        usleep(150 * 1000);
+
+        /* 8. Отправляем КОРРЕКТНЫЙ ответ B (новый context/generation). */
+        reply_hdr.context = b_hdr.context;
+        nova_rpc_xdr_encode_struct(good_reply, sizeof(good_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE, b_hdr.task_id);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, b_args.value);
+        write(server_rfd, good_reply, sizeof(good_reply));
+
+        /* 9. Проверяем успешное завершение B — СВОИМ значением, не
+         * 0xDEADBEEF от запоздавшего ответа A (буфер B не был испорчен). */
+        pthread_join(b_thread, NULL);
+        CHECK("ABA: B успешно завершился со СВОИМ значением, буфер не испорчен "
+              "запоздавшим ответом A (0xDEADBEEF)",
+              b_args.rc == 8 && b_args.got_value == b_args.value);
+    }
+
+    /* --- ТЗ §4.1 (дополнительно): context==0, максимальный context,
+     * случайный context, и повреждённый (слишком короткий) payload —
+     * все должны безопасно отбрасываться dispatch_reply(), не падать.
+     * Вызываем dispatch_reply() напрямую с синтетическими сообщениями
+     * (без реального FIFO) — таблица pending[] сейчас пуста, поэтому
+     * ЛЮБОЙ context либо попадёт на FREE-слот (-ESTALE), либо (если
+     * случайно совпадёт с чем-то WAITING — невозможно, пусто) был бы
+     * принят; здесь мы проверяем именно безопасный отказ. */
+    {
+        uint8_t msg[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        nova_rpc_struct_t h;
+        int rc;
+
+        h.program_id = NOVA_RPC_REPLYID; h.version_id = NOVA_RPC_REPLYID;
+        h.procedure_id = 0; h.task_id = 0; h.sys_pid = 0; h.parameter_size = 8;
+
+        h.context = 0;
+        nova_rpc_xdr_encode_struct(msg, sizeof(msg), &h);
+        rc = nova_rpc_transport_dispatch_reply(&t, msg, sizeof(msg));
+        CHECK("context==0 на пустой таблице безопасно отброшен (-ESTALE), не падает",
+              rc == -ESTALE);
+
+        h.context = 0xFFFFFFFFu; /* максимальный context: slot=63, max generation */
+        nova_rpc_xdr_encode_struct(msg, sizeof(msg), &h);
+        rc = nova_rpc_transport_dispatch_reply(&t, msg, sizeof(msg));
+        CHECK("максимальный context (0xFFFFFFFF) безопасно отброшен, не падает и не UB "
+              "(слот всегда в диапазоне 0..63 — защищено маской, структурно невозможен "
+              "'неверный slot_index')",
+              rc == -ESTALE);
+
+        srand(999);
+        h.context = (uint32_t)rand();
+        nova_rpc_xdr_encode_struct(msg, sizeof(msg), &h);
+        rc = nova_rpc_transport_dispatch_reply(&t, msg, sizeof(msg));
+        CHECK("случайный context безопасно отброшен, не падает",
+              rc == -ESTALE || rc == -ENOENT);
+
+        h.context = 0;
+        h.parameter_size = 2; /* < 4 байт — нет даже taskID */
+        nova_rpc_xdr_encode_struct(msg, NOVA_RPC_STRUCT_WIRE_SIZE + 2, &h);
+        rc = nova_rpc_transport_dispatch_reply(&t, msg, NOVA_RPC_STRUCT_WIRE_SIZE + 2);
+        CHECK("payload < 4 байт (нет места для taskID) отклонён -EBADMSG, не падает",
+              rc == -EBADMSG);
+    }
 
     stop = 1;
     pthread_join(disp, NULL);
