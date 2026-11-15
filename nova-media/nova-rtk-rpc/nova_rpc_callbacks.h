@@ -72,6 +72,16 @@ typedef struct nova_rpc_callback_entry {
     /* >0, пока handler этой записи выполняется вне mutex (см. выше) —
      * unregister() этой записи ждёт, пока busy не станет 0. */
     int busy;
+    /* ТЗ "RPC Transport Complete Closure" §4.1 — найденный и исправленный
+     * реальный deadlock: если handler сам вызывает unregister() на
+     * СВОЮ ЖЕ запись (self-unregister), наивное "ждать busy==0" ждёт
+     * навечно, т.к. busy может стать 0 только ПОСЛЕ возврата из этого
+     * самого handler, который в этот момент блокирован внутри
+     * unregister(). `busy_thread` хранит id потока, выполняющего
+     * handler этой записи прямо сейчас — unregister() сравнивает его с
+     * `pthread_self()`, чтобы отличить self-unregister (не ждать) от
+     * удаления ЧУЖИМ потоком (ждать, как раньше). */
+    pthread_t busy_thread;
 } nova_rpc_callback_entry_t;
 
 typedef struct nova_rpc_callback_ctx {
