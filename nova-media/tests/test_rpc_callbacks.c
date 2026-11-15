@@ -298,36 +298,42 @@ int main(void)
         nova_rpc_callbacks_destroy(&ctx2);
     }
 
-    /* --- Стресс-тест (ТЗ §8: "многопоточный stress-test", "одновременная
-     * регистрация и dispatch"): N потоков постоянно register/dispatch/
-     * unregister на одном ctx, пока M других потоков непрерывно
+    /* --- Стресс-тест (ТЗ §4.3/§8: "минимум 8 потоков", "не ограничиваться
+     * 200мс", "несколько повторений"): N потоков постоянно register/
+     * dispatch/unregister на одном ctx, пока M других потоков непрерывно
      * dispatch()-ят сообщения — под ASan/TSan это ловит и use-after-free
-     * (unregister во время выполнения handler), и гонки данных. */
+     * (unregister во время выполнения handler), и гонки данных.
+     * В этом этапе (ТЗ "RPC Transport Complete Closure" §4.3) увеличено:
+     * 8+8=16 потоков (было 4+4=8), 1000мс на прогон (было 200мс), 3
+     * независимых повторения (было 1) — каждое со свежим ctx. */
     {
-        nova_rpc_callback_ctx_t ctx3;
-        pthread_t churners[4], dispatchers[4];
-        int i;
+        int rep;
+        for (rep = 0; rep < 3; rep++) {
+            nova_rpc_callback_ctx_t ctx3;
+            pthread_t churners[8], dispatchers[8];
+            int i;
 
-        nova_rpc_callbacks_init(&ctx3);
-        g_stress_ctx = &ctx3;
-        atomic_store(&g_stress_stop, 0);
+            nova_rpc_callbacks_init(&ctx3);
+            g_stress_ctx = &ctx3;
+            atomic_store(&g_stress_stop, 0);
 
-        for (i = 0; i < 4; i++)
-            pthread_create(&churners[i], NULL, stress_churn_thread, NULL);
-        for (i = 0; i < 4; i++)
-            pthread_create(&dispatchers[i], NULL, stress_dispatch_thread, NULL);
+            for (i = 0; i < 8; i++)
+                pthread_create(&churners[i], NULL, stress_churn_thread, NULL);
+            for (i = 0; i < 8; i++)
+                pthread_create(&dispatchers[i], NULL, stress_dispatch_thread, NULL);
 
-        usleep(200 * 1000); /* дать потокам поработать под нагрузкой */
-        atomic_store(&g_stress_stop, 1);
+            usleep(1000 * 1000); /* дать потокам поработать под нагрузкой */
+            atomic_store(&g_stress_stop, 1);
 
-        for (i = 0; i < 4; i++)
-            pthread_join(churners[i], NULL);
-        for (i = 0; i < 4; i++)
-            pthread_join(dispatchers[i], NULL);
+            for (i = 0; i < 8; i++)
+                pthread_join(churners[i], NULL);
+            for (i = 0; i < 8; i++)
+                pthread_join(dispatchers[i], NULL);
 
-        nova_rpc_callbacks_destroy(&ctx3);
-        printf("ok   callback stress-test (concurrent register/dispatch/unregister) "
-               "completed without crash/deadlock (%d joins)\n", 8);
+            nova_rpc_callbacks_destroy(&ctx3);
+        }
+        printf("ok   callback stress-test: 3 повторения по 16 потоков (8 churn + 8 dispatch), "
+               "1с каждое — без краша/deadlock\n");
     }
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
