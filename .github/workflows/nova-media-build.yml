@@ -145,4 +145,30 @@ jobs:
           path: tsan-report.txt
           retention-days: 14
 
+  fault-injection-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run fault-injection tests with ASan+UBSan
+        run: |
+          cd nova-media
+          make test_rpc_fault_injection \
+              CROSS_COMPILE= CFLAGS="-Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-vdec -Inova-rtk-rpc"
+          STATUS=0
+          for t in test_rpc_fault_injection; do
+            echo "=== $t ===" | tee -a ../fault-injection-report.txt
+            ./$t 2>&1 | tee -a ../fault-injection-report.txt
+            rc=${PIPESTATUS[0]}
+            echo "exit=$rc" | tee -a ../fault-injection-report.txt
+            if [ "$rc" -ne 0 ]; then STATUS=1; fi
+          done
+          exit $STATUS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nova-media-fault-injection-report-${{ github.run_id }}
+          path: fault-injection-report.txt
+          retention-days: 14
+
   # gstreamer-nova-rtk НЕ собирается: вне приоритета этого этапа.
