@@ -225,6 +225,7 @@ int main(void)
     int failures = 0;
     int marker = 42;
 
+    setvbuf(stdout, NULL, _IOLBF, 0); /* см. комментарий в test_rpc_lifecycle.c */
     install_watchdog(15);
     nova_rpc_callbacks_init(&ctx);
 
