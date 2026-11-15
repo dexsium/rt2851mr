@@ -29,7 +29,21 @@
  * `RPCProxy_loop()` — `pthread_mutex_lock(pData->pMutex)`).
  *
  * Статус: IMPLEMENTED, COMPILED, MOCK_TESTED (см. tests/test_rpc_callbacks.c).
- */
+ *
+ * ИСПРАВЛЕНИЕ (ТЗ "RPC Transport Hardening", §8 — реальная находка при
+ * построчном аудите, не гипотетическая): в предыдущей версии dispatch()
+ * вызывал `handler()` ПОКА `ctx->mutex` был удержан. Если handler сам
+ * вызывает `nova_rpc_callbacks_dispatch()`/`register()`/`unregister()` на
+ * том же `ctx` (рекурсивный dispatch, повторная регистрация из callback —
+ * оба сценария прямо требуются ТЗ §8 к проверке), это гарантированный
+ * deadlock на невозвратном (non-recursive) pthread_mutex. Исправлено:
+ * dispatch() теперь копирует handler+user_data и отпускает `mutex` ДО
+ * вызова handler; запись помечается `busy=1` на время вызова, и
+ * unregister() для busy-записи ждёт на `busy_cond`, а не разрушает
+ * user_data немедленно — так предотвращается use-after-free ценой
+ * того, что unregister() может на короткое время заблокироваться, если
+ * handler этой же записи выполняется прямо сейчас (документированное,
+ * проверенное тестами поведение, не гонка). */
 #ifndef NOVA_RPC_CALLBACKS_H
 #define NOVA_RPC_CALLBACKS_H
 
@@ -55,11 +69,15 @@ typedef struct nova_rpc_callback_entry {
     nova_rpc_handler_fn handler;
     void *user_data;
     int active;
+    /* >0, пока handler этой записи выполняется вне mutex (см. выше) —
+     * unregister() этой записи ждёт, пока busy не станет 0. */
+    int busy;
 } nova_rpc_callback_entry_t;
 
 typedef struct nova_rpc_callback_ctx {
     nova_rpc_callback_entry_t entries[NOVA_RPC_CALLBACKS_MAX_HANDLERS];
     pthread_mutex_t mutex;
+    pthread_cond_t busy_cond;
 } nova_rpc_callback_ctx_t;
 
 void nova_rpc_callbacks_init(nova_rpc_callback_ctx_t *ctx);
