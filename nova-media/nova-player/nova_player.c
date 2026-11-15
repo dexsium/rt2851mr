@@ -277,6 +277,25 @@ nova_player_t *nova_player_create(void)
         return NULL;
     }
 
+    /* ТЗ §8.1 "Для CI предусмотреть headless-режим с fakesink" —
+     * НАЙДЕНО в этой сессии (реальный heap-buffer-overflow, не
+     * гипотетический, см. отчёт): без этого `autovideosink` в
+     * headless-CI-контейнере (нет X11/Wayland/framebuffer) выбирает
+     * `dfbvideosink` (DirectFB), чей собственный плагин
+     * (gstreamer1.0-plugins-bad) содержит самостоятельный
+     * heap-buffer-overflow в своём surface pool allocator — падение НЕ
+     * в nova_player, а в сторонней библиотеке, выбранной автоопределением
+     * не по адресу для безголового окружения. `fakesink` с `sync=TRUE`
+     * ведёт себя как настоящий sink по времени (важно для A/V-синка,
+     * ТЗ §10), но не трогает никакое реальное видео/аудио устройство. */
+    if (getenv("NOVA_PLAYER_HEADLESS")) {
+        GstElement *vsink = gst_element_factory_make("fakesink", "nova-fake-vsink");
+        GstElement *asink = gst_element_factory_make("fakesink", "nova-fake-asink");
+        if (vsink) g_object_set(vsink, "sync", TRUE, NULL);
+        if (asink) g_object_set(asink, "sync", TRUE, NULL);
+        g_object_set(p->playbin, "video-sink", vsink, "audio-sink", asink, NULL);
+    }
+
     p->bus = gst_element_get_bus(p->playbin);
     p->ctx = g_main_context_new();
     p->loop = g_main_loop_new(p->ctx, FALSE);
