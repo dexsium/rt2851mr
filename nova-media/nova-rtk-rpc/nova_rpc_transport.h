@@ -41,6 +41,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h> /* ssize_t — для nova_fi_write_hook ниже */
 
 #ifdef __cplusplus
 extern "C" {
@@ -237,6 +238,23 @@ int nova_rpc_transport_dispatch_reply(nova_rpc_transport_t *t,
 int nova_rpc_transport_signal_number(void);
 
 void nova_rpc_transport_close(nova_rpc_transport_t *t);
+
+/*
+ * ТЗ "RPC Transport Complete Closure" п.16/17/19 — fault injection seam.
+ * Указатели-перехватчики для malloc()/pthread_mutex_init()/
+ * pthread_cond_init()/write(), используемые ВНУТРИ nova_rpc_transport.c.
+ * По умолчанию NULL — реальная функция вызывается как обычно, нулевая
+ * стоимость в production (одна проверка на NULL за вызов). Тестовый код
+ * (`tests/test_rpc_fault_injection.c`) устанавливает их перед вызовом
+ * open()/call(), чтобы детерминированно внедрить отказ на конкретном
+ * по счёту вызове — без необходимости реального исчерпания памяти/
+ * ресурсов CI-машины (прямое требование ТЗ §9) и без отдельной
+ * пересборки этого файла. ВСЕГДА возвращать их в NULL после теста —
+ * иначе следующий тест в том же процессе неожиданно унаследует отказ. */
+extern void *(*nova_fi_malloc_hook)(size_t);
+extern int (*nova_fi_mutex_init_hook)(pthread_mutex_t *, const pthread_mutexattr_t *);
+extern int (*nova_fi_cond_init_hook)(pthread_cond_t *, const pthread_condattr_t *);
+extern ssize_t (*nova_fi_write_hook)(int, const void *, size_t);
 
 #ifdef __cplusplus
 }
