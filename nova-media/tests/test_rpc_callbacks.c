@@ -151,6 +151,63 @@ static void *stress_dispatch_thread(void *arg)
     return NULL;
 }
 
+/* --- ТЗ "RPC Transport Complete Closure" п.15: lifetime/ownership
+ * user_data — ДЕТЕРМИНИРОВАННО (не по времени) доказываем, что
+ * unregister() из ДРУГОГО потока не может вернуться раньше, чем
+ * handler закончит использовать user_data. Логика: handler, начав
+ * выполняться, зависает на спине до явного разрешения; главный поток
+ * ждёт (детерминированно) начала выполнения handler, затем запускает
+ * unregister() в отдельном потоке и ТОЛЬКО ПОСЛЕ ЭТОГО разрешает
+ * handler продолжить. unregister()-поток сам, сразу после своего
+ * возврата (без каких-либо задержек), проверяет флаг "handler уже
+ * закончил" — если реализация корректна, это ВСЕГДА true (порядок
+ * гарантирован busy/busy_cond, не угадан по времени). */
+static atomic_int g_lifetime_running;
+static atomic_int g_lifetime_release;
+static atomic_int g_lifetime_finished;
+static int g_lifetime_user_data_ok;
+
+static void lifetime_handler(const nova_rpc_struct_t *hdr, const uint8_t *payload,
+                              size_t payload_size, void *user_data)
+{
+    int *val = (int *)user_data;
+    (void)hdr; (void)payload; (void)payload_size;
+    atomic_store(&g_lifetime_running, 1);
+    while (!atomic_load(&g_lifetime_release))
+        ; /* ждём явного разрешения от главного потока (см. main) */
+    g_lifetime_user_data_ok = (*val == 123);
+    atomic_store(&g_lifetime_finished, 1);
+}
+
+struct dispatch_once_args {
+    nova_rpc_callback_ctx_t *ctx;
+    const uint8_t *buf;
+    size_t len;
+};
+
+static void *dispatch_once_thread(void *arg)
+{
+    struct dispatch_once_args *a = (struct dispatch_once_args *)arg;
+    nova_rpc_callbacks_dispatch(a->ctx, a->buf, a->len);
+    return NULL;
+}
+
+struct unreg_thread_args {
+    nova_rpc_callback_ctx_t *ctx;
+    int handle;
+    int finished_before_return;
+};
+
+static void *unregister_thread_fn(void *arg)
+{
+    struct unreg_thread_args *a = (struct unreg_thread_args *)arg;
+    nova_rpc_callbacks_unregister(a->ctx, a->handle);
+    /* Проверяем СРАЗУ по возврату, без единой лишней инструкции между
+     * ними — это и есть сам инвариант, не предположение. */
+    a->finished_before_return = atomic_load(&g_lifetime_finished);
+    return NULL;
+}
+
 static void build_message(uint8_t *buf, size_t buf_size,
                            uint32_t program_id, uint32_t version_id,
                            uint32_t procedure_id, size_t payload_size)
@@ -296,6 +353,56 @@ int main(void)
         }
 
         nova_rpc_callbacks_destroy(&ctx2);
+    }
+
+    /* --- ТЗ "RPC Transport Complete Closure" п.15: lifetime/ownership
+     * user_data (детерминированный тест порядка, см. комментарий выше). */
+    {
+        nova_rpc_callback_ctx_t ctx_life;
+        int *data = (int *)malloc(sizeof(int));
+        int handle_life;
+        pthread_t t_dispatch, t_unreg;
+        uint8_t life_msg[NOVA_RPC_STRUCT_WIRE_SIZE];
+        struct dispatch_once_args doa;
+        struct unreg_thread_args uargs;
+
+        *data = 123;
+        nova_rpc_callbacks_init(&ctx_life);
+        atomic_store(&g_lifetime_running, 0);
+        atomic_store(&g_lifetime_release, 0);
+        atomic_store(&g_lifetime_finished, 0);
+        g_lifetime_user_data_ok = 0;
+
+        handle_life = nova_rpc_callbacks_register(&ctx_life, 55, 0, lifetime_handler, data);
+        build_message(life_msg, sizeof(life_msg), 55, 0, 0, 0);
+
+        doa.ctx = &ctx_life; doa.buf = life_msg; doa.len = sizeof(life_msg);
+        pthread_create(&t_dispatch, NULL, dispatch_once_thread, &doa);
+
+        /* Детерминированный барьер: ждём, пока handler РЕАЛЬНО начнёт
+         * выполняться (и сам зависнет на своей собственной спине). */
+        while (!atomic_load(&g_lifetime_running))
+            ;
+
+        uargs.ctx = &ctx_life; uargs.handle = handle_life; uargs.finished_before_return = -1;
+        pthread_create(&t_unreg, NULL, unregister_thread_fn, &uargs);
+
+        /* Только ТЕПЕРЬ разрешаем handler продолжить и завершиться —
+         * unregister()-поток в этот момент либо уже начал ждать busy_cond,
+         * либо как раз пытается это сделать; в любом случае он не может
+         * корректно вернуться раньше этого момента. */
+        atomic_store(&g_lifetime_release, 1);
+
+        pthread_join(t_dispatch, NULL);
+        pthread_join(t_unreg, NULL);
+        free(data);
+        nova_rpc_callbacks_destroy(&ctx_life);
+
+        CHECK("lifetime: user_data оставался валиден внутри handler всё время выполнения",
+              g_lifetime_user_data_ok);
+        CHECK("lifetime: unregister() из другого потока НЕ вернулся раньше, чем handler "
+              "закончил использовать user_data (инвариант порядка, не угадан по времени)",
+              uargs.finished_before_return == 1);
     }
 
     /* --- Стресс-тест (ТЗ §4.3/§8: "минимум 8 потоков", "не ограничиваться
