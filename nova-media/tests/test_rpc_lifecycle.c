@@ -152,6 +152,23 @@ static void *waiter_fn(void *arg)
     return NULL;
 }
 
+/* ТЗ "Realtek VDEC/VO & GStreamer" п.3.2: "close() во время заблокированной
+ * операции отправки" — большой (8КБ) payload максимизирует реальное время,
+ * проведённое внутри write() под send_mutex, увеличивая шанс, что close()
+ * придётся РЕАЛЬНО застать вызов именно в этой фазе, не только в ожидании
+ * ответа. */
+static void *big_waiter_fn(void *arg)
+{
+    struct client_wait_args *c = (struct client_wait_args *)arg;
+    static uint8_t args[8192];
+    uint8_t result[4];
+    c->rc = nova_rpc_transport_call(c->t,
+                                     NOVA_RPC_T_BLOCK_MODE | NOVA_RPC_T_USE_POLL_BUF | NOVA_RPC_T_SEND_VIDEO_CPU,
+                                     NOVA_RPC_PROGRAM_VIDEO_SYSTEM, NOVA_RPC_VERSION_VIDEO,
+                                     1, args, sizeof(args), result, sizeof(result), 400);
+    return NULL;
+}
+
 /* ТЗ "RPC Transport Complete Closure" п.10: close() одновременно с ЖИВЫМ
  * dispatch_reply() (не последовательно, как в предыдущих этапах — здесь
  * dispatch_reply() вызывается в тесном цикле ДРУГИМ потоком, пока main
@@ -447,6 +464,37 @@ int main(void)
             CHECK("NONBLOCK_MODE-вызов на уже закрытом транспорте честно возвращает -ENODEV",
                   rc_after == -ENODEV);
         }
+    }
+
+    /* --- ТЗ "Realtek VDEC/VO & GStreamer" п.3.2: close() ИМЕННО во время
+     * заблокированной отправки (большой payload, не только во время
+     * ожидания ответа, как в сценарии 5/6 выше). */
+    {
+        pthread_t opener6, big_waiter;
+        struct client_wait_args cwa;
+
+        pthread_create(&opener6, NULL, peer_opener_thread, &oa);
+        ret = nova_rpc_transport_open(&t);
+        pthread_join(opener6, NULL);
+        CHECK("Открытие перед тестом close() vs заблокированная отправка успешно", ret == 0);
+
+        cwa.t = &t; cwa.rc = 0;
+        pthread_create(&big_waiter, NULL, big_waiter_fn, &cwa);
+        {
+            int seen = 0;
+            while (!seen) {
+                pthread_mutex_lock(&t.pending_mutex);
+                seen = (t.waiters > 0);
+                pthread_mutex_unlock(&t.pending_mutex);
+            }
+        }
+        nova_rpc_transport_close(&t); /* гонка с реально большой отправкой (8КБ) */
+        pthread_join(big_waiter, NULL);
+        CHECK("close() во время заблокированной отправки большого payload безопасен "
+              "(нет use-after-close/use-after-destroy/deadlock — иначе ASan/TSan job "
+              "сам бы упал) и вызов честно завершается -ESHUTDOWN",
+              cwa.rc == -ESHUTDOWN);
+        close_peers();
     }
 
     /* --- Финальное открытие для проверки на утечки fd и чистого выхода --- */
