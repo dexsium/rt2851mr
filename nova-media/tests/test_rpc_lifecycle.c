@@ -337,17 +337,25 @@ int main(void)
         pthread_t opener5, t_open, t_close;
         struct open_race_args ora;
 
+        /* НАЙДЕНО (реальное зависание, не гипотетически — поймано
+         * watchdog'ом в CI): нельзя join'ить opener5 ДО старта open() —
+         * peer_opener_thread() открывает только ОДНУ сторону каждого из
+         * 12 FIFO (`open_peers()`), блокируясь в ожидании, что именно
+         * nova_rpc_transport_open() откроет ВТОРУЮ сторону — это
+         * РЕНДЕЗВУ двух конкурентных блокирующих open(), как и во ВСЕХ
+         * остальных сценариях этого файла (см. сценарий 1 выше). Если
+         * join'ить opener5 первым (как было здесь по ошибке), он висит
+         * навечно — никто не открывает вторую сторону. Исправлено:
+         * opener5 запускается КОНКУРЕНТНО с open_race_fn, join — после
+         * обоих. */
         pthread_create(&opener5, NULL, peer_opener_thread, &oa);
-        pthread_join(opener5, NULL); /* пиры готовы ДО гонки — иначе open()
-                                       * сам заблокируется на открытии fd,
-                                       * а не на борьбе за g_close_guard,
-                                       * и гонка не будет настоящей */
 
         ora.t = &t; ora.rc = -999;
         pthread_create(&t_open, NULL, open_race_fn, &ora);
         pthread_create(&t_close, NULL, closer_fn, &t); /* t уже CLOSED —
                                                          * close() на уже
                                                          * закрытом идемпотентен */
+        pthread_join(opener5, NULL);
         pthread_join(t_open, NULL);
         pthread_join(t_close, NULL);
 
