@@ -408,6 +408,7 @@ int main(void)
     int ret;
     int server_wfd, server_rfd;
 
+    setvbuf(stdout, NULL, _IOLBF, 0); /* см. комментарий в test_rpc_lifecycle.c */
     install_watchdog(60);
     srand(12345); /* детерминированный seed — тест воспроизводим */
 
