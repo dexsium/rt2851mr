@@ -125,6 +125,33 @@ int main(void)
         if (ret3 == 0)
             nova_rpc_transport_close(&t);
         close_peers();
+
+        /* ТЗ п.18: тот же механизм, для 1-й (WPOLL_A) и последней (12-й,
+         * RINTR_V2) ноды по порядку открытия — раньше проверялся только
+         * 6-й. */
+        {
+            int ret4, ret5;
+
+            setup_with_one_broken(dir, 0 /* WPOLL_A, 1-я по порядку */);
+            ret4 = nova_rpc_transport_open(&t);
+            CHECK("частичная инициализация (сломан 1-й из 12 fd): open() "
+                  "честно провалился", ret4 < 0);
+            close_peers();
+
+            setup_with_one_broken(dir, 11 /* RINTR_V2, последняя (12-я) по порядку */);
+            ret5 = nova_rpc_transport_open(&t);
+            CHECK("частичная инициализация (сломан последний, 12-й из 12 fd): "
+                  "open() честно провалился", ret5 < 0);
+            close_peers();
+
+            setup_with_one_broken(dir, -1);
+            ret5 = nova_rpc_transport_open(&t);
+            CHECK("после отказов на 1-м и последнем fd повторное открытие "
+                  "со всеми корректными путями снова успешно", ret5 == 0);
+            if (ret5 == 0)
+                nova_rpc_transport_close(&t);
+            close_peers();
+        }
     }
 
     printf("%d passed, %d failed\n", g_passed, g_failed);
