@@ -74,8 +74,27 @@ static ssize_t poll_read(int fd, void *buf, size_t cap, const atomic_int *stop)
     while (!*stop) {
         struct pollfd pfd = { fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, POLL_STEP_MS);
-        if (pr > 0 && (pfd.revents & POLLIN))
-            return read(fd, buf, cap);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            /* ТЗ "Realtek VDEC/VO & GStreamer" п.3.3: read() сам может
+             * вернуть -1/EINTR (прерван сигналом) — раньше это честно НЕ
+             * ретраилось и ошибочно трактовалось read_exact() как жёсткий
+             * провал. POSIX требует повторить именно read(), не весь
+             * poll()-цикл заново. */
+            ssize_t r = read(fd, buf, cap);
+            if (r < 0 && errno == EINTR)
+                continue;
+            return r;
+        }
+        if (pr > 0 && (pfd.revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            /* НАЙДЕННЫЙ реальный баг (ТЗ п.3.3, сценарий EBADF): если fd
+             * закрыт/невалиден, poll() даёт POLLNVAL, НЕ POLLIN — раньше
+             * ни одна ветка этого не ловила, и цикл крутился БЕСКОНЕЧНО
+             * (pr>0, но ни один if не сработал — while просто повторяется).
+             * POLLHUP без POLLIN — пир закрылся и данных больше нет,
+             * тоже не повод продолжать опрашивать вечно. */
+            errno = (pfd.revents & POLLNVAL) ? EBADF : EIO;
+            return -1;
+        }
         if (pr < 0 && errno != EINTR)
             return -1;
     }
