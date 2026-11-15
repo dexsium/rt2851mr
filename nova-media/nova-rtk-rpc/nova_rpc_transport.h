@@ -175,6 +175,7 @@ typedef struct nova_rpc_transport {
      * сериализовать вызовы на РАЗНЫЕ CPU-таргеты/буферы друг с
      * другом без необходимости. */
     pthread_mutex_t send_mutex[6];
+    nova_rpc_pending_t pending[NOVA_RPC_T_MAX_PENDING];
     pthread_mutex_t pending_mutex;
     /* ВАЖНО (найдено ThreadSanitizer, не гипотетически): условная
      * переменная ожидания ответа ОБЯЗАНА использовать ТОТ ЖЕ мьютекс, что
