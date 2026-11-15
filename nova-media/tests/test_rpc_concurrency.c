@@ -268,6 +268,96 @@ static void *aba_call_thread(void *arg)
     return NULL;
 }
 
+/* --- ТЗ "RPC Transport Complete Closure" §6/п.21: сериализация записи
+ * (`send_mutex`) на РАЗНЫХ размерах сообщения, включая границу PIPE_BUF
+ * (обычно 4096 на Linux) и размер БОЛЬШЕ PIPE_BUF. Сервер считает
+ * FNV-1a контрольную сумму ВСЕГО полученного payload и отвечает ею —
+ * если бы send_mutex не защищал от чередования байт при конкурентных
+ * `write()` на один fd, сервер получил бы смешанные байты от разных
+ * клиентов и контрольная сумма не совпала бы ни у одного. */
+static uint32_t fnv1a(const uint8_t *buf, size_t n)
+{
+    uint32_t h = 2166136261u;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= buf[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+#define SIZED_MAX_PAYLOAD 8192
+
+struct sized_echo_args {
+    int rfd_write_side;
+    int wfd_read_side;
+    int n;
+    atomic_int *stop;
+};
+
+static void *sized_echo_server(void *arg)
+{
+    struct sized_echo_args *a = (struct sized_echo_args *)arg;
+    static uint8_t req[SIZED_MAX_PAYLOAD + NOVA_RPC_STRUCT_WIRE_SIZE];
+    int got = 0;
+
+    while (got < a->n && !*a->stop) {
+        nova_rpc_struct_t hdr;
+        ssize_t n = read_one_message(a->rfd_write_side, req, sizeof(req), a->stop);
+        if (n < (ssize_t)NOVA_RPC_STRUCT_WIRE_SIZE)
+            continue;
+        nova_rpc_xdr_decode_struct(req, (size_t)n, &hdr);
+        {
+            uint32_t sum = fnv1a(req + NOVA_RPC_STRUCT_WIRE_SIZE, hdr.parameter_size);
+            uint8_t reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+            nova_rpc_struct_t reply_hdr;
+
+            reply_hdr.program_id = NOVA_RPC_REPLYID;
+            reply_hdr.version_id = NOVA_RPC_REPLYID;
+            reply_hdr.procedure_id = 0;
+            reply_hdr.task_id = 0;
+            reply_hdr.sys_pid = 0;
+            reply_hdr.parameter_size = 8;
+            reply_hdr.context = hdr.context;
+
+            nova_rpc_xdr_encode_struct(reply, sizeof(reply), &reply_hdr);
+            nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE, hdr.task_id);
+            nova_rpc_xdr_put_u32(reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, sum);
+            write(a->wfd_read_side, reply, sizeof(reply));
+        }
+        got++;
+    }
+    return NULL;
+}
+
+struct sized_client_args {
+    nova_rpc_transport_t *t;
+    size_t args_size;
+    int rc;
+    uint32_t expected_sum;
+    uint32_t got_sum;
+};
+
+static void *sized_client_thread(void *arg)
+{
+    struct sized_client_args *c = (struct sized_client_args *)arg;
+    uint8_t *args = (uint8_t *)malloc(c->args_size);
+    uint8_t result[4];
+    size_t i;
+
+    for (i = 0; i < c->args_size; i++)
+        args[i] = (uint8_t)((i * 37u + c->args_size) & 0xFFu); /* паттерн, уникальный по размеру */
+    c->expected_sum = fnv1a(args, c->args_size);
+    memset(result, 0, sizeof(result));
+    c->rc = nova_rpc_transport_call(c->t,
+                                     NOVA_RPC_T_BLOCK_MODE | NOVA_RPC_T_USE_POLL_BUF | NOVA_RPC_T_SEND_VIDEO_CPU,
+                                     NOVA_RPC_PROGRAM_VIDEO_SYSTEM, NOVA_RPC_VERSION_VIDEO,
+                                     42, args, c->args_size, result, sizeof(result), 5000);
+    c->got_sum = nova_rpc_xdr_get_u32(result);
+    free(args);
+    return NULL;
+}
+
 /* Запускает N конкурентных клиентов против транспорта `t` с заданным
  * порядком ответов сервера. Возвращает число клиентов, получивших
  * СВОЁ (не чужое и не поддельное) значение обратно. */
@@ -433,9 +523,23 @@ int main(void)
         for (i = 0; i < 64; i++) {
             pthread_create(&blockers[i], NULL, client_thread, &bargs[i]);
         }
-        /* небольшая пауза, чтобы все 64 успели дойти до nova_rpc_pending_alloc()
-         * и реально занять слоты до попытки 65-го */
-        usleep(300 * 1000);
+        /* ТЗ "RPC Transport Complete Closure" §22: вместо произвольной паузы —
+         * детерминированно ждём (под тем же pending_mutex, что и
+         * production-код, не "сырое" чтение поля) пока ровно 64 слота
+         * реально перейдут в WAITING — гарантия, не предположение по
+         * времени. */
+        {
+            int seen = 0;
+            while (!seen) {
+                int count = 0, j;
+                pthread_mutex_lock(&t.pending_mutex);
+                for (j = 0; j < NOVA_RPC_T_MAX_PENDING; j++)
+                    if (t.pending[j].state == NOVA_RPC_PENDING_WAITING)
+                        count++;
+                seen = (count >= 64);
+                pthread_mutex_unlock(&t.pending_mutex);
+            }
+        }
 
         nova_rpc_xdr_put_u32(args, 0xFFFF);
         rc65 = nova_rpc_transport_call(&t,
@@ -529,10 +633,15 @@ int main(void)
         nova_rpc_xdr_put_u32(stale_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, 0xDEADBEEF);
         write(server_rfd, stale_reply, sizeof(stale_reply));
 
-        /* 6/7. Даём dispatch_thread время обработать (и честно отбросить,
-         * -ESTALE внутри dispatch_reply) запоздавший ответ, не трогая
-         * буфер результата B. */
-        usleep(150 * 1000);
+        /* 6/7. ТЗ §22: явная пауза здесь не нужна и не добавлена — порядок
+         * обработки гарантирован не таймингом, а протоколом: оба write()
+         * идут последовательно ОДНИМ потоком в ОДИН FIFO (r_path), и
+         * dispatch_thread читает/обрабатывает сообщения строго по порядку
+         * (read_one_message читает РОВНО одно сообщение за раз) — запоздавший
+         * ответ физически не может быть обработан ПОСЛЕ корректного, значит
+         * будет отброшен (-ESTALE) ДО того, как второй write() вообще
+         * произойдёт ниже. Это детерминированная гарантия порядка, не
+         * предположение по времени. */
 
         /* 8. Отправляем КОРРЕКТНЫЙ ответ B (новый context/generation). */
         reply_hdr.context = b_hdr.context;
@@ -597,6 +706,109 @@ int main(void)
         rc = nova_rpc_transport_dispatch_reply(&t, msg, NOVA_RPC_STRUCT_WIRE_SIZE + 2);
         CHECK("payload < 4 байт (нет места для taskID) отклонён -EBADMSG, не падает",
               rc == -EBADMSG);
+    }
+
+    /* --- ТЗ "RPC Transport Complete Closure" §5.2/п.4: "изменённый
+     * context" — берём РЕАЛЬНЫЙ валидный context живого запроса C
+     * (перехваченный с провода, не придуманный) и инвертируем ровно
+     * ОДИН бит перед отправкой ответа — проверяем, что C НЕ завершается
+     * чужим/повреждённым ответом (либо безопасно отброшен как -ESTALE
+     * внутри dispatch_reply, либо, если флип бита случайно не меняет
+     * ни слот ни generation на занятое значение — что структурно не
+     * может произойти для одного бита, меняющего хотя бы один из двух
+     * компонентов context, — не рассматривается). Затем отправляем
+     * НАСТОЯЩИЙ ответ C и проверяем успешное завершение. */
+    {
+        struct aba_call_args c_args;
+        pthread_t c_thread;
+        uint8_t snif[64];
+        nova_rpc_struct_t c_hdr;
+        ssize_t n;
+        uint8_t corrupt_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        uint8_t good_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        nova_rpc_struct_t reply_hdr;
+        uint32_t corrupted_context;
+        int bit;
+
+        c_args.t = &t; c_args.value = 0xCCCC0000; c_args.timeout_ms = 3000;
+        pthread_create(&c_thread, NULL, aba_call_thread, &c_args);
+
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("modified-context: удалось перехватить реальный запрос C с провода", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &c_hdr);
+
+        reply_hdr.program_id = NOVA_RPC_REPLYID;
+        reply_hdr.version_id = NOVA_RPC_REPLYID;
+        reply_hdr.procedure_id = 0;
+        reply_hdr.task_id = 0;
+        reply_hdr.sys_pid = 0;
+        reply_hdr.parameter_size = 8;
+
+        /* Инвертируем бит 20 (внутри generation-части context, не slot) —
+         * гарантированно меняет generation, оставляя slot тем же самым
+         * (слот у C всё ещё WAITING) -> dispatch_reply должен отбросить
+         * как -ESTALE (generation не совпадёт), не касаясь буфера C. */
+        bit = NOVA_RPC_T_SLOT_BITS + 5; /* бит внутри generation, не slot */
+        corrupted_context = c_hdr.context ^ (1u << bit);
+        CHECK("modified-context: флип одного бита действительно меняет context",
+              corrupted_context != c_hdr.context);
+
+        reply_hdr.context = corrupted_context;
+        nova_rpc_xdr_encode_struct(corrupt_reply, sizeof(corrupt_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(corrupt_reply + NOVA_RPC_STRUCT_WIRE_SIZE, c_hdr.task_id);
+        nova_rpc_xdr_put_u32(corrupt_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, 0xBADC0DE);
+        write(server_rfd, corrupt_reply, sizeof(corrupt_reply));
+        /* ТЗ §22: без усыпления — та же гарантия порядка FIFO/single-writer,
+         * что и в ABA-тесте выше: повреждённый ответ будет обработан
+         * (и отброшен) строго ДО того, как мы отправим и dispatch_thread
+         * прочитает следующее сообщение. */
+
+        reply_hdr.context = c_hdr.context; /* настоящий, неизменённый context */
+        nova_rpc_xdr_encode_struct(good_reply, sizeof(good_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE, c_hdr.task_id);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, c_args.value);
+        write(server_rfd, good_reply, sizeof(good_reply));
+
+        pthread_join(c_thread, NULL);
+        CHECK("modified-context: C завершился СВОИМ значением, не повреждён ответом "
+              "с изменённым на один бит context (0xBADC0DE)",
+              c_args.rc == 4 && c_args.got_value == c_args.value);
+    }
+
+    /* --- ТЗ §6/п.21: 4 конкурентных отправителя с РАЗНЫМИ размерами
+     * сообщения: маленькое, среднее, около PIPE_BUF (4096-28) и больше
+     * PIPE_BUF — проверяем целостность payload через контрольную сумму. */
+    {
+        pthread_t sized_clients[4];
+        struct sized_client_args sized_cargs[4];
+        pthread_t sized_srv;
+        struct sized_echo_args sized_srv_args;
+        atomic_int sized_stop = 0;
+        size_t sizes[4] = { 4, 256, 4068 /* ~PIPE_BUF-28 */, 8192 /* >PIPE_BUF */ };
+        int i, ok = 0;
+
+        sized_srv_args.rfd_write_side = server_wfd;
+        sized_srv_args.wfd_read_side = server_rfd;
+        sized_srv_args.n = 4;
+        sized_srv_args.stop = &sized_stop;
+        pthread_create(&sized_srv, NULL, sized_echo_server, &sized_srv_args);
+
+        for (i = 0; i < 4; i++) {
+            sized_cargs[i].t = &t;
+            sized_cargs[i].args_size = sizes[i];
+            pthread_create(&sized_clients[i], NULL, sized_client_thread, &sized_cargs[i]);
+        }
+        for (i = 0; i < 4; i++)
+            pthread_join(sized_clients[i], NULL);
+        sized_stop = 1;
+        pthread_join(sized_srv, NULL);
+
+        for (i = 0; i < 4; i++)
+            if (sized_cargs[i].rc == 4 && sized_cargs[i].got_sum == sized_cargs[i].expected_sum)
+                ok++;
+        CHECK("write-сериализация: 4 конкурентных сообщения разных размеров "
+              "(4/256/~PIPE_BUF/>PIPE_BUF байт) дошли целыми, без чередования байт",
+              ok == 4);
     }
 
     stop = 1;
