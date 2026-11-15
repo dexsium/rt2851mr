@@ -811,6 +811,97 @@ int main(void)
               ok == 4);
     }
 
+    /* --- ТЗ "RPC Transport Complete Closure" п.2: граница generation без
+     * 67 миллионов реальных RPC-вызовов. Напрямую (whitebox — поле
+     * `generation` публично в структуре, как и везде в этом файле)
+     * устанавливаем значение ОКОЛО границы перед очередным выделением —
+     * тестовый механизм не даёт production-коду никакого НОВОГО пути
+     * произвольно менять внутреннее состояние (сам production-код этот
+     * путь не использует и не предоставляет для этого никакого API). */
+    {
+        struct aba_call_args d_args, e_args, f_args;
+        pthread_t d_thread, e_thread, f_thread;
+        uint8_t snif[64];
+        nova_rpc_struct_t d_hdr, e_hdr, f_hdr;
+        ssize_t n;
+        uint8_t stale_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        uint8_t good_reply[NOVA_RPC_STRUCT_WIRE_SIZE + 8];
+        nova_rpc_struct_t reply_hdr;
+        int slot;
+
+        /* D: занимает слот, таймаут -> освобождается (таблица пуста
+         * до этого, значит слот будет 0, но мы определяем его честно
+         * из перехваченного context, не предполагаем). */
+        d_args.t = &t; d_args.value = 0xD0000000u; d_args.timeout_ms = 200;
+        pthread_create(&d_thread, NULL, aba_call_thread, &d_args);
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("generation-boundary: удалось перехватить реальный запрос D", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &d_hdr);
+        pthread_join(d_thread, NULL);
+        CHECK("generation-boundary: D честно завершился по тайм-ауту", d_args.rc == -ETIMEDOUT);
+
+        slot = (int)(d_hdr.context & NOVA_RPC_T_SLOT_MASK);
+
+        /* Принудительно ставим generation этого свободного слота в
+         * GEN_MASK-1 — "около границы", без реальных 2^26 вызовов. */
+        pthread_mutex_lock(&t.pending_mutex);
+        t.pending[slot].generation = NOVA_RPC_T_GEN_MASK - 1;
+        pthread_mutex_unlock(&t.pending_mutex);
+
+        /* E: следующее выделение -> (GEN_MASK-1+1)&GEN_MASK == GEN_MASK —
+         * "последнее допустимое значение". */
+        e_args.t = &t; e_args.value = 0xE0000000u; e_args.timeout_ms = 200;
+        pthread_create(&e_thread, NULL, aba_call_thread, &e_args);
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("generation-boundary: удалось перехватить реальный запрос E", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &e_hdr);
+        CHECK("generation-boundary: E получил ровно последнее допустимое значение "
+              "generation (GEN_MASK)",
+              (e_hdr.context >> NOVA_RPC_T_SLOT_BITS) == NOVA_RPC_T_GEN_MASK);
+        pthread_join(e_thread, NULL);
+        CHECK("generation-boundary: E честно завершился по тайм-ауту", e_args.rc == -ETIMEDOUT);
+
+        /* F: следующее выделение -> (GEN_MASK+1)&GEN_MASK == 0 —
+         * "переход через границу" (циклический wrap). */
+        f_args.t = &t; f_args.value = 0xF0000000u; f_args.timeout_ms = 3000;
+        pthread_create(&f_thread, NULL, aba_call_thread, &f_args);
+        n = read_one_message(server_wfd, snif, sizeof(snif), &stop);
+        CHECK("generation-boundary: удалось перехватить реальный запрос F", n > 0);
+        nova_rpc_xdr_decode_struct(snif, (size_t)n, &f_hdr);
+        CHECK("generation-boundary: F получил generation==0 после перехода через "
+              "границу (корректный циклический wrap, не UB)",
+              (f_hdr.context >> NOVA_RPC_T_SLOT_BITS) == 0);
+        CHECK("generation-boundary: F переиспользовал тот же индекс слота",
+              (f_hdr.context & NOVA_RPC_T_SLOT_MASK) == (uint32_t)slot);
+
+        /* "Обработка старых ответов" / "повторное использование context":
+         * шлём ответ со СТАРЫМ (E, generation==GEN_MASK) context — должен
+         * быть отвергнут, не задев буфер F (у которого generation==0). */
+        reply_hdr.program_id = NOVA_RPC_REPLYID;
+        reply_hdr.version_id = NOVA_RPC_REPLYID;
+        reply_hdr.procedure_id = 0;
+        reply_hdr.task_id = 0;
+        reply_hdr.sys_pid = 0;
+        reply_hdr.parameter_size = 8;
+        reply_hdr.context = e_hdr.context; /* старый, пограничный context (E) */
+        nova_rpc_xdr_encode_struct(stale_reply, sizeof(stale_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(stale_reply + NOVA_RPC_STRUCT_WIRE_SIZE, e_hdr.task_id);
+        nova_rpc_xdr_put_u32(stale_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, 0xBADF00D);
+        write(server_rfd, stale_reply, sizeof(stale_reply));
+        /* Без usleep — тот же порядок FIFO/single-writer, что в ABA-тесте выше. */
+
+        reply_hdr.context = f_hdr.context; /* настоящий, пограничный (gen==0) context F */
+        nova_rpc_xdr_encode_struct(good_reply, sizeof(good_reply), &reply_hdr);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE, f_hdr.task_id);
+        nova_rpc_xdr_put_u32(good_reply + NOVA_RPC_STRUCT_WIRE_SIZE + 4, f_args.value);
+        write(server_rfd, good_reply, sizeof(good_reply));
+
+        pthread_join(f_thread, NULL);
+        CHECK("generation-boundary: F завершился СВОИМ значением сразу после перехода "
+              "через границу generation, не задет старым ответом E (0xBADF00D)",
+              f_args.rc == 4 && f_args.got_value == f_args.value);
+    }
+
     stop = 1;
     pthread_join(disp, NULL);
     close(server_wfd);
