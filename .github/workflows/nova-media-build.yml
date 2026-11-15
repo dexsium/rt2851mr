@@ -188,4 +188,35 @@ jobs:
           path: bench-report.txt
           retention-days: 14
 
+  nova-player-gstreamer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GStreamer (software decode/encode, no hardware involved)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            pkg-config
+      - name: Build and run nova-player tests (real GStreamer pipeline, software only)
+        run: |
+          cd nova-media
+          make test_nova_player
+          STATUS=0
+          echo "=== test_nova_player ===" | tee -a ../nova-player-report.txt
+          ./test_nova_player 2>&1 | tee -a ../nova-player-report.txt
+          rc=${PIPESTATUS[0]}
+          echo "exit=$rc" | tee -a ../nova-player-report.txt
+          if [ "$rc" -ne 0 ]; then STATUS=1; fi
+          exit $STATUS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nova-media-player-report-${{ github.run_id }}
+          path: nova-player-report.txt
+          retention-days: 14
+
   # gstreamer-nova-rtk НЕ собирается: вне приоритета этого этапа.
