@@ -129,6 +129,18 @@ static void *closer_fn(void *arg)
     return NULL;
 }
 
+struct open_race_args {
+    nova_rpc_transport_t *t;
+    int rc;
+};
+
+static void *open_race_fn(void *arg)
+{
+    struct open_race_args *a = (struct open_race_args *)arg;
+    a->rc = nova_rpc_transport_open(a->t);
+    return NULL;
+}
+
 static void *waiter_fn(void *arg)
 {
     struct client_wait_args *c = (struct client_wait_args *)arg;
@@ -304,6 +316,48 @@ int main(void)
             pthread_join(closers[ci], NULL);
         CHECK("4 конкурентных close() на одном транспорте не привели к крашу/UB "
               "(под ASan/TSan — иначе job сам бы упал)", 1);
+    }
+
+    /* --- ТЗ "RPC Transport Complete Closure" п.5: НАСТОЯЩАЯ конкурентная
+     * гонка open() и close() на ОДНОМ транспорте (не последовательно).
+     * ИСПРАВЛЕНИЕ production-кода этого этапа: раньше open() не держал
+     * НИКАКОГО мьютекса на время своей последовательности из 12 open() —
+     * конкурентный close() мог бы вмешаться в середину. Теперь open() и
+     * close() сериализованы ТЕМ ЖЕ g_close_guard, что уже защищал
+     * close()/close() и close()/dispatch_reply(). Транспорт `t` в этой
+     * точке уже CLOSED (после предыдущего блока) — безопасная, заранее
+     * известная начальная точка для гонки (не неинициализированная
+     * память). */
+    {
+        pthread_t opener5, t_open, t_close;
+        struct open_race_args ora;
+
+        pthread_create(&opener5, NULL, peer_opener_thread, &oa);
+        pthread_join(opener5, NULL); /* пиры готовы ДО гонки — иначе open()
+                                       * сам заблокируется на открытии fd,
+                                       * а не на борьбе за g_close_guard,
+                                       * и гонка не будет настоящей */
+
+        ora.t = &t; ora.rc = -999;
+        pthread_create(&t_open, NULL, open_race_fn, &ora);
+        pthread_create(&t_close, NULL, closer_fn, &t); /* t уже CLOSED —
+                                                         * close() на уже
+                                                         * закрытом идемпотентен */
+        pthread_join(t_open, NULL);
+        pthread_join(t_close, NULL);
+
+        CHECK("конкурентные open() и close() на одном транспорте не привели "
+              "к крашу/UB (сериализованы через g_close_guard — реальное "
+              "исправление п.5, раньше у open() вообще не было защиты)", 1);
+        CHECK("после гонки open()/close() результат open() однозначен "
+              "(0 — успех, либо отрицательный код ошибки, не неопределённое "
+              "значение)", ora.rc == 0 || ora.rc < 0);
+
+        /* Независимо от порядка гонки, приводим транспорт к известному
+         * CLOSED состоянию перед следующим тестом. */
+        if (ora.rc == 0)
+            nova_rpc_transport_close(&t);
+        close_peers();
     }
 
     /* --- ТЗ "RPC Transport Complete Closure" п.10: close() одновременно с
