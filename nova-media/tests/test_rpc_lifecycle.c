@@ -199,11 +199,24 @@ int main(void)
         cwa.t = &t;
         cwa.rc = 0;
         pthread_create(&waiter, NULL, waiter_fn, &cwa);
-        /* Даём потоку реальный шанс войти в pthread_cond_timedwait() ДО
-         * close() — наилучшее доступное приближение к "непосредственно
-         * перед ожиданием", не гарантия, но достаточно для детерминированного
-         * воспроизведения на практике (timeout у waiter_fn — 400мс). */
-        usleep(20 * 1000);
+        /* ТЗ "RPC Transport Complete Closure" §8/§22: убрана зависимость
+         * от usleep() как "доказательства" конкурентной корректности —
+         * вместо угадывания задержки ждём ДЕТЕРМИНИРОВАННО, пока
+         * waiter_fn реально зарегистрируется как waiter внутри
+         * nova_rpc_transport_call() (t.waiters>0 под ТЕМ ЖЕ pending_mutex,
+         * что и производственный код — не произвольное чтение поля,
+         * которое TSan корректно пометил бы гонкой данных). Это
+         * гарантирует, что гонка close() vs call() ниже РЕАЛЬНА, а не
+         * "предположительно успела начаться" по таймеру. install_watchdog(30)
+         * выше — аварийный выход, если это предположение всё же неверно. */
+        {
+            int seen = 0;
+            while (!seen) {
+                pthread_mutex_lock(&t.pending_mutex);
+                seen = (t.waiters > 0);
+                pthread_mutex_unlock(&t.pending_mutex);
+            }
+        }
         nova_rpc_transport_close(&t); /* НАСТОЯЩАЯ гонка close() vs активный call() */
         pthread_join(waiter, NULL);
         CHECK("5/6. close() конкурентно с активным call() безопасен (нет use-after-destroy) "
