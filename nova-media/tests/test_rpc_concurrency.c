@@ -71,8 +71,27 @@ static ssize_t poll_read(int fd, void *buf, size_t cap, const atomic_int *stop)
     while (!*stop) {
         struct pollfd pfd = { fd, POLLIN, 0 };
         int pr = poll(&pfd, 1, POLL_STEP_MS);
-        if (pr > 0 && (pfd.revents & POLLIN))
-            return read(fd, buf, cap);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            /* ТЗ "Realtek VDEC/VO & GStreamer" п.3.3: read() сам может
+             * вернуть -1/EINTR (прерван сигналом) — раньше это честно НЕ
+             * ретраилось и ошибочно трактовалось read_exact() как жёсткий
+             * провал. POSIX требует повторить именно read(), не весь
+             * poll()-цикл заново. */
+            ssize_t r = read(fd, buf, cap);
+            if (r < 0 && errno == EINTR)
+                continue;
+            return r;
+        }
+        if (pr > 0 && (pfd.revents & (POLLERR | POLLNVAL | POLLHUP))) {
+            /* НАЙДЕННЫЙ реальный баг (ТЗ п.3.3, сценарий EBADF): если fd
+             * закрыт/невалиден, poll() даёт POLLNVAL, НЕ POLLIN — раньше
+             * ни одна ветка этого не ловила, и цикл крутился БЕСКОНЕЧНО
+             * (pr>0, но ни один if не сработал — while просто повторяется).
+             * POLLHUP без POLLIN — пир закрылся и данных больше нет,
+             * тоже не повод продолжать опрашивать вечно. */
+            errno = (pfd.revents & POLLNVAL) ? EBADF : EIO;
+            return -1;
+        }
         if (pr < 0 && errno != EINTR)
             return -1;
     }
@@ -99,9 +118,16 @@ static ssize_t read_exact(int fd, void *buf, size_t n, const atomic_int *stop)
         if (r < 0)
             return -1;
         if (r == 0) {
-            if (*stop)
-                return (ssize_t)got;
-            continue; /* poll_read() вернул 0 из-за stop-проверки внутри своего цикла — не EOF */
+            /* ТЗ "Realtek VDEC/VO & GStreamer" п.3.3 — НАЙДЕННЫЙ реальный
+             * баг (не гипотетический): poll_read() возвращает 0 ОБА раза —
+             * когда *stop стал истинным И когда read() вернул настоящий
+             * EOF (писатель закрыл свой конец) — эти два случая отсюда
+             * неотличимы по значению. Раньше EOF-без-stop уходил в
+             * `continue` — то есть БЕСКОНЕЧНЫЙ busy-spin: fd, вернувший
+             * EOF один раз, будет возвращать EOF и дальше, *stop никогда
+             * не станет true сам по себе. В обоих случаях ждать больше
+             * нечего — всегда возвращаем то, что успели собрать. */
+            return (ssize_t)got;
         }
         got += (size_t)r;
     }
@@ -901,6 +927,58 @@ int main(void)
         CHECK("generation-boundary: F завершился СВОИМ значением сразу после перехода "
               "через границу generation, не задет старым ответом E (0xBADF00D)",
               f_args.rc == 4 && f_args.got_value == f_args.value);
+    }
+
+    /* --- ТЗ "Realtek VDEC/VO & GStreamer" п.3.3: read fault injection на
+     * собственных тестовых read-хелперах (`poll_read`/`read_exact`) —
+     * честно: сам nova_rpc_transport.c НЕ делает read() (это обязанность
+     * вызывающего кода), поэтому инъекция здесь — в тестовой обвязке,
+     * которая и воспроизводит реальные находки. Оба бага ниже — РЕАЛЬНЫЕ
+     * бесконечные циклы, найденные построчным ревью, а не гипотезы. */
+    {
+        char fdir[256];
+        char fpath[256];
+        int rfd, wfd;
+        atomic_int fstop = 0;
+        uint8_t buf[64];
+        double t0, elapsed_ms;
+        struct timespec ts0, ts1;
+        ssize_t n;
+
+        snprintf(fdir, sizeof(fdir), "/tmp/nova_rpc_readfi_%d", (int)getpid());
+        mkdir(fdir, 0700);
+        snprintf(fpath, sizeof(fpath), "%s/p", fdir);
+        mkfifo(fpath, 0600);
+
+        /* EOF: писатель закрывается, НЕ дав полного сообщения — раньше
+         * read_exact() уходил в бесконечный busy-spin (EOF-без-stop
+         * трактовался как "подождать ещё"). Теперь должен ВЕРНУТЬСЯ сразу
+         * с тем, что успел собрать (0 байт здесь — писатель вообще
+         * ничего не отправил). */
+        rfd = open(fpath, O_RDONLY | O_NONBLOCK);
+        wfd = open(fpath, O_WRONLY | O_NONBLOCK);
+        close(wfd); /* писатель закрыт СРАЗУ, без единого байта */
+
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        n = read_exact(rfd, buf, sizeof(buf), &fstop);
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+        t0 = elapsed_ms; /* чисто для читаемости CHECK ниже */
+        CHECK("read fault injection: EOF без stop-флага не вызывает "
+              "бесконечный busy-spin (read_exact вернулся быстро, а не "
+              "по watchdog)", n == 0 && t0 < 2000.0);
+        close(rfd);
+
+        /* EBADF/POLLNVAL: читаем из УЖЕ ЗАКРЫТОГО fd — poll() вернёт
+         * POLLNVAL, не POLLIN. Раньше ни одна ветка poll_read() это не
+         * ловила — бесконечный спин (pr>0, но ни один if не совпадал). */
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        n = read_exact(rfd /* уже close()'нут строкой выше */, buf, sizeof(buf), &fstop);
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) / 1e6;
+        CHECK("read fault injection: чтение из закрытого fd (POLLNVAL) "
+              "честно возвращает ошибку быстро, не бесконечный спин",
+              n < 0 && elapsed_ms < 2000.0);
     }
 
     stop = 1;
