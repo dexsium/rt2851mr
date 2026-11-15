@@ -544,9 +544,14 @@ int main(void)
         /* 9. Проверяем успешное завершение B — СВОИМ значением, не
          * 0xDEADBEEF от запоздавшего ответа A (буфер B не был испорчен). */
         pthread_join(b_thread, NULL);
+        /* rc == 4, не 8: dispatch_reply() снимает первые 4 байта payload
+         * (result_taskID) ПЕРЕД копированием в result_buf (см. .c,
+         * SVCFunc.c:78-89) — result_len считает именно СКОПИРОВАННЫЕ
+         * байты (только значение), как и во всех остальных проверках
+         * этого файла (ср. client_thread: `c->rc == 4`). */
         CHECK("ABA: B успешно завершился со СВОИМ значением, буфер не испорчен "
               "запоздавшим ответом A (0xDEADBEEF)",
-              b_args.rc == 8 && b_args.got_value == b_args.value);
+              b_args.rc == 4 && b_args.got_value == b_args.value);
     }
 
     /* --- ТЗ §4.1 (дополнительно): context==0, максимальный context,
