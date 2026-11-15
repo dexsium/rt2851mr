@@ -52,6 +52,27 @@ static const char *nova_env_or(const char *env_name, const char *fallback)
  * прямо перед nova_rpc_transport_close(). */
 static pthread_mutex_t g_close_guard = PTHREAD_MUTEX_INITIALIZER;
 
+/* ТЗ "RPC Transport Complete Closure" п.16/17/19 — fault injection:
+ * указатели-перехватчики для malloc/pthread_mutex_init/pthread_cond_init/
+ * write(), по умолчанию NULL (нулевая стоимость в production — один
+ * сравнение-с-NULL на вызов, реальная функция вызывается как обычно).
+ * Тестовый код (`tests/test_rpc_fault_injection.c`) устанавливает их,
+ * чтобы детерминированно внедрить отказ на N-м вызове, без необходимости
+ * отдельной сборки этого файла или реального исчерпания памяти машины
+ * (прямое требование ТЗ §9: "не исчерпывать физическую память
+ * CI-машины"; "использовать контролируемые обёртки, dependency
+ * injection"). НЕ статические (внешняя линковка) — иначе тестовый файл
+ * не смог бы их переопределить. */
+void *(*nova_fi_malloc_hook)(size_t) = NULL;
+int (*nova_fi_mutex_init_hook)(pthread_mutex_t *, const pthread_mutexattr_t *) = NULL;
+int (*nova_fi_cond_init_hook)(pthread_cond_t *, const pthread_condattr_t *) = NULL;
+ssize_t (*nova_fi_write_hook)(int, const void *, size_t) = NULL;
+
+#define NOVA_FI_MALLOC(sz) (nova_fi_malloc_hook ? nova_fi_malloc_hook(sz) : malloc(sz))
+#define NOVA_FI_MUTEX_INIT(m, a) (nova_fi_mutex_init_hook ? nova_fi_mutex_init_hook((m), (a)) : pthread_mutex_init((m), (a)))
+#define NOVA_FI_COND_INIT(c, a) (nova_fi_cond_init_hook ? nova_fi_cond_init_hook((c), (a)) : pthread_cond_init((c), (a)))
+#define NOVA_FI_WRITE(fd, buf, n) (nova_fi_write_hook ? nova_fi_write_hook((fd), (buf), (n)) : write((fd), (buf), (n)))
+
 int nova_rpc_transport_signal_number(void)
 {
     /* Оставлено для совместимости интерфейса с предыдущей версией этого
@@ -59,12 +80,50 @@ int nova_rpc_transport_signal_number(void)
     return 0;
 }
 
+/* Закрывает только fd (без mutex/cond — для путей отказа ДО их
+ * инициализации) и приводит структуру в чистое CLOSED-состояние. Вызов
+ * БЕЗ захвата g_close_guard — вызывающий код (open()) уже держит его;
+ * повторный захват того же (невозвратного) мьютекса — deadlock. */
+static void nova_rpc_transport_close_fds_only(nova_rpc_transport_t *t)
+{
+    if (t->fd_poll_audio >= 0) close(t->fd_poll_audio);
+    if (t->fd_intr_audio >= 0) close(t->fd_intr_audio);
+    if (t->fd_poll_video >= 0) close(t->fd_poll_video);
+    if (t->fd_intr_video >= 0) close(t->fd_intr_video);
+    if (t->fd_poll_video2 >= 0) close(t->fd_poll_video2);
+    if (t->fd_intr_video2 >= 0) close(t->fd_intr_video2);
+    if (t->rfd_poll_audio >= 0) close(t->rfd_poll_audio);
+    if (t->rfd_intr_audio >= 0) close(t->rfd_intr_audio);
+    if (t->rfd_poll_video >= 0) close(t->rfd_poll_video);
+    if (t->rfd_intr_video >= 0) close(t->rfd_intr_video);
+    if (t->rfd_poll_video2 >= 0) close(t->rfd_poll_video2);
+    if (t->rfd_intr_video2 >= 0) close(t->rfd_intr_video2);
+
+    memset(t, 0, sizeof(*t));
+    t->fd_poll_audio = t->fd_intr_audio = -1;
+    t->fd_poll_video = t->fd_intr_video = -1;
+    t->fd_poll_video2 = t->fd_intr_video2 = -1;
+    t->rfd_poll_audio = t->rfd_intr_audio = -1;
+    t->rfd_poll_video = t->rfd_intr_video = -1;
+    t->rfd_poll_video2 = t->rfd_intr_video2 = -1;
+    t->state = NOVA_RPC_T_STATE_CLOSED;
+}
+
 int nova_rpc_transport_open(nova_rpc_transport_t *t)
 {
-    int i;
+    int i, rc;
 
     if (!t)
         return -EINVAL;
+
+    /* ТЗ §5/п.5: сериализует open() с close()/dispatch_reply() (тот же
+     * g_close_guard) — настоящее исправление реального архитектурного
+     * пробела: раньше open() не держал НИКАКОГО мьютекса на время своей
+     * последовательности из 12 open(), и конкурентный close() на том же
+     * объекте мог бы вмешаться в середине (двойная инициализация/гонка
+     * на полях структуры). Теперь open()/close()/dispatch_reply() на
+     * одном транспорте строго взаимно исключают друг друга. */
+    pthread_mutex_lock(&g_close_guard);
 
     /* ТЗ §5.1: повторный open() на уже открытом транспорте не должен
      * перезаписывать структуру/утекать fd. `state` ещё не было
@@ -74,8 +133,10 @@ int nova_rpc_transport_open(nova_rpc_transport_t *t)
      * равно пройдёт этот if как false — безопасно. На уже-открытом
      * транспорте (state == OPEN) НЕ трогаем существующие дескрипторы
      * и mutex/cond. */
-    if (t->state == NOVA_RPC_T_STATE_OPEN || t->state == NOVA_RPC_T_STATE_OPENING)
+    if (t->state == NOVA_RPC_T_STATE_OPEN || t->state == NOVA_RPC_T_STATE_OPENING) {
+        pthread_mutex_unlock(&g_close_guard);
         return -EALREADY;
+    }
 
     memset(t, 0, sizeof(*t));
     t->state = NOVA_RPC_T_STATE_OPENING;
@@ -104,18 +165,54 @@ int nova_rpc_transport_open(nova_rpc_transport_t *t)
         t->rfd_poll_video < 0 || t->rfd_intr_video < 0 ||
         t->rfd_poll_video2 < 0 || t->rfd_intr_video2 < 0) {
         int err = -errno;
-        t->state = NOVA_RPC_T_STATE_UNINITIALIZED;
-        nova_rpc_transport_close(t);
+        nova_rpc_transport_close_fds_only(t);
+        pthread_mutex_unlock(&g_close_guard);
         return err;
     }
 
-    pthread_mutex_init(&t->pending_mutex, NULL);
-    pthread_cond_init(&t->pending_cond, NULL);
-    for (i = 0; i < 6; i++)
-        pthread_mutex_init(&t->send_mutex[i], NULL);
+    /* ТЗ п.17 — РЕАЛЬНАЯ НАХОДКА, не гипотетическая: раньше возврат
+     * pthread_mutex_init()/pthread_cond_init() ИГНОРИРОВАЛСЯ полностью —
+     * если бы они когда-либо отказали (крайне редко, но возможно,
+     * например EAGAIN при исчерпании системных ресурсов потоков), open()
+     * всё равно вернул бы 0 (успех) с НЕИНИЦИАЛИЗИРОВАННЫМ mutex/cond —
+     * прямое нарушение требования ТЗ §9/§17 "ошибки не должны
+     * возвращаться вызывающему коду замаскированными под успешный
+     * результат". Исправлено: каждый код возврата проверяется, при
+     * отказе — аккуратная очистка уже инициализированного (в обратном
+     * порядке) и честный возврат ошибки. */
+    rc = NOVA_FI_MUTEX_INIT(&t->pending_mutex, NULL);
+    if (rc != 0) {
+        nova_rpc_transport_close_fds_only(t);
+        pthread_mutex_unlock(&g_close_guard);
+        return -rc;
+    }
+
+    rc = NOVA_FI_COND_INIT(&t->pending_cond, NULL);
+    if (rc != 0) {
+        pthread_mutex_destroy(&t->pending_mutex);
+        nova_rpc_transport_close_fds_only(t);
+        pthread_mutex_unlock(&g_close_guard);
+        return -rc;
+    }
+
+    for (i = 0; i < 6; i++) {
+        rc = NOVA_FI_MUTEX_INIT(&t->send_mutex[i], NULL);
+        if (rc != 0) {
+            int j;
+            for (j = 0; j < i; j++)
+                pthread_mutex_destroy(&t->send_mutex[j]);
+            pthread_cond_destroy(&t->pending_cond);
+            pthread_mutex_destroy(&t->pending_mutex);
+            nova_rpc_transport_close_fds_only(t);
+            pthread_mutex_unlock(&g_close_guard);
+            return -rc;
+        }
+    }
+
     t->opened = 1;
     t->waiters = 0;
     t->state = NOVA_RPC_T_STATE_OPEN;
+    pthread_mutex_unlock(&g_close_guard);
     return 0;
 }
 
@@ -245,7 +342,7 @@ int nova_rpc_transport_call(nova_rpc_transport_t *t, int opt,
     }
 
     total = NOVA_RPC_STRUCT_WIRE_SIZE + args_size;
-    buf = (uint8_t *)malloc(total);
+    buf = (uint8_t *)NOVA_FI_MALLOC(total);
     if (!buf) {
         pthread_mutex_lock(&t->pending_mutex);
         t->waiters--;
@@ -291,7 +388,7 @@ int nova_rpc_transport_call(nova_rpc_transport_t *t, int opt,
     {
         int mi = nova_rpc_pick_send_mutex_index(opt);
         pthread_mutex_lock(&t->send_mutex[mi]);
-        n = write(fd, buf, total);
+        n = NOVA_FI_WRITE(fd, buf, total);
         pthread_mutex_unlock(&t->send_mutex[mi]);
     }
     free(buf);
