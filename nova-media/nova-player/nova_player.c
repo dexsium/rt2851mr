@@ -48,6 +48,24 @@ struct nova_player {
     pthread_t bus_thread;
     int bus_thread_started;
 
+    /* НАЙДЕННЫЙ реальный баг (CI watchdog, не гипотетический): если
+     * nova_player_destroy() вызывает g_main_loop_quit() ДО того, как
+     * фоновый поток РЕАЛЬНО начал выполнять g_main_loop_run() (не
+     * просто был создан через pthread_create — ОС могла ещё не успеть
+     * его запустить), это НЕ останавливает цикл. Внутри GLib
+     * `g_main_loop_run()` безусловно выставляет `is_running = TRUE` на
+     * входе, независимо от того, что `quit()` уже сбросил его в FALSE
+     * ДО этого момента — цикл крутится вечно, join() висит навсегда.
+     * Исправлено: отдельный idle-источник, прикреплённый к ЭТОМУ ЖЕ
+     * контексту, сигналит `loop_ready` ИЗНУТРИ первой же итерации
+     * `g_main_context_iteration()` — то есть гарантированно ПОСЛЕ того,
+     * как `is_running` уже `TRUE`. nova_player_create() ждёт этот
+     * сигнал перед возвратом — к моменту, когда вызывающий код МОЖЕТ
+     * позвать destroy(), гонка уже невозможна. */
+    pthread_mutex_t ready_mutex;
+    pthread_cond_t ready_cond;
+    int loop_ready;
+
     pthread_mutex_t mutex;
     nova_player_state_t state;
 
@@ -188,6 +206,18 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data)
     return TRUE;
 }
 
+/* Срабатывает ИЗНУТРИ первой итерации g_main_context_iteration() внутри
+ * g_main_loop_run() — см. комментарий у loop_ready в структуре выше. */
+static gboolean mark_loop_ready(gpointer data)
+{
+    nova_player_t *p = (nova_player_t *)data;
+    pthread_mutex_lock(&p->ready_mutex);
+    p->loop_ready = 1;
+    pthread_cond_signal(&p->ready_cond);
+    pthread_mutex_unlock(&p->ready_mutex);
+    return FALSE; /* одноразовый idle-источник, GLib сам его удалит */
+}
+
 static void *bus_thread_fn(void *arg)
 {
     nova_player_t *p = (nova_player_t *)arg;
@@ -249,8 +279,18 @@ nova_player_t *nova_player_create(void)
     g_source_attach(p->bus_source, p->ctx);
 
     pthread_mutex_init(&p->mutex, NULL);
+    pthread_mutex_init(&p->ready_mutex, NULL);
+    pthread_cond_init(&p->ready_cond, NULL);
+    p->loop_ready = 0;
     p->state = NOVA_PLAYER_IDLE;
     atomic_store(&p->shutting_down, 0);
+
+    {
+        GSource *idle = g_idle_source_new();
+        g_source_set_callback(idle, mark_loop_ready, p, NULL);
+        g_source_attach(idle, p->ctx);
+        g_source_unref(idle); /* контекст сам держит ссылку; одноразовый, снимется после срабатывания */
+    }
 
 #ifdef NOVA_PLAYER_DEBUG_TRACE
     fprintf(stderr, "[trace] nova_player_create: spawning bus thread\n"); fflush(stderr);
@@ -263,10 +303,26 @@ nova_player_t *nova_player_create(void)
         gst_object_unref(p->bus);
         gst_object_unref(p->playbin);
         pthread_mutex_destroy(&p->mutex);
+        pthread_mutex_destroy(&p->ready_mutex);
+        pthread_cond_destroy(&p->ready_cond);
         free(p);
         return NULL;
     }
     p->bus_thread_started = 1;
+
+    /* Ждём, пока луп РЕАЛЬНО начнёт итерацию (см. комментарий у
+     * loop_ready) — только после этого destroy() может безопасно
+     * вызвать g_main_loop_quit() с гарантированным эффектом. */
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: waiting for loop_ready\n"); fflush(stderr);
+#endif
+    pthread_mutex_lock(&p->ready_mutex);
+    while (!p->loop_ready)
+        pthread_cond_wait(&p->ready_cond, &p->ready_mutex);
+    pthread_mutex_unlock(&p->ready_mutex);
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: loop_ready confirmed, returning\n"); fflush(stderr);
+#endif
 
     return p;
 }
@@ -434,5 +490,7 @@ void nova_player_destroy(nova_player_t *p)
     gst_object_unref(p->bus);
     gst_object_unref(p->playbin);
     pthread_mutex_destroy(&p->mutex);
+    pthread_mutex_destroy(&p->ready_mutex);
+    pthread_cond_destroy(&p->ready_cond);
     free(p);
 }
