@@ -90,7 +90,7 @@ GST_CFLAGS := $(shell pkg-config --cflags gstreamer-1.0 2>/dev/null)
 GST_LIBS := $(shell pkg-config --libs gstreamer-1.0 2>/dev/null)
 
 test_nova_player: tests/test_nova_player.c nova-player/nova_player.c nova-player/nova_player.h nova-player/nova_media_events.h
-	gcc -Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -Inova-player $(GST_CFLAGS) \
+	gcc -Wall -Wextra -std=gnu11 -O0 -g -fsanitize=address,undefined -DNOVA_PLAYER_DEBUG_TRACE -Inova-player $(GST_CFLAGS) \
 	    -o test_nova_player tests/test_nova_player.c nova-player/nova_player.c $(GST_LIBS) -lpthread
 
 MOCK_TESTS = test_ioctl_abi test_rpc_protocol test_rpc_xdr test_rpc_callbacks \
