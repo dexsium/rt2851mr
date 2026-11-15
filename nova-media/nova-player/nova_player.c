@@ -123,6 +123,13 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data)
     if (atomic_load(&p->shutting_down))
         return TRUE;
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] bus_callback: msg type=%s from=%s\n",
+            GST_MESSAGE_TYPE_NAME(msg),
+            GST_MESSAGE_SRC(msg) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "(null)");
+    fflush(stderr);
+#endif
+
     switch (GST_MESSAGE_TYPE(msg)) {
     case GST_MESSAGE_ASYNC_DONE: {
         nova_player_state_t prev;
@@ -345,6 +352,10 @@ int nova_player_open(nova_player_t *p, const char *path)
     if (!p || !path)
         return -EINVAL;
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_open: enter path=%s\n", path); fflush(stderr);
+#endif
+
     if (!realpath(path, abspath)) {
         int e = errno;
         pthread_mutex_lock(&p->mutex);
@@ -363,6 +374,9 @@ int nova_player_open(nova_player_t *p, const char *path)
         return -EINVAL;
     }
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_open: uri=%s, set_state(NULL)\n", uri); fflush(stderr);
+#endif
     gst_element_set_state(p->playbin, GST_STATE_NULL); /* на случай повторного open() на этом же плеере */
     g_object_set(p->playbin, "uri", uri, NULL);
     g_free(uri);
@@ -371,9 +385,15 @@ int nova_player_open(nova_player_t *p, const char *path)
     p->state = NOVA_PLAYER_OPENING;
     pthread_mutex_unlock(&p->mutex);
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_open: set_state(PAUSED)\n"); fflush(stderr);
+#endif
     /* PAUSED запускает preroll (typefind+decodebin+caps negotiation) —
      * завершение сигнализируется ASYNC_DONE на bus (см. bus_callback). */
     gst_element_set_state(p->playbin, GST_STATE_PAUSED);
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_open: set_state(PAUSED) returned, open() returning\n"); fflush(stderr);
+#endif
     return 0;
 }
 
