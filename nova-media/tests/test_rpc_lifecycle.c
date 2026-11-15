@@ -104,6 +104,38 @@ static void close_peers(void)
     g_peer_count = 0;
 }
 
+/* ТЗ "Realtek VDEC/VO & GStreamer" п.5 — НАЙДЕНО: конкурентный open()/
+ * close() тест (ниже) с open_peers()/peer_opener_thread() (блокирующее
+ * рандеву ОДНОЙ стороны) оказался НЕДЕТЕРМИНИРОВАННЫМ — прошёл в одном
+ * прогоне CI, завис в другом (поймано watchdog'ом), т.к. успех зависел
+ * от точного порядка планирования ОС между opener5 и t_open. Для ЭТОГО
+ * конкретного теста используем ту же проверенную схему, что в
+ * test_rpc_concurrency.c/test_rpc_transport.c: ОБА конца каждого из 12
+ * FIFO открываются неблокирующе (RDONLY первым — всегда немедленно по
+ * POSIX, затем WRONLY|O_NONBLOCK — читатель уже есть, без ENXIO) ДО
+ * старта гонки open()/close(), так что сама гонка больше НЕ зависит ни
+ * от какого тайминга рандеву — production-код просто находит оба конца
+ * уже готовыми. */
+static void open_peers_nonblocking_both_ends(const char *dir)
+{
+    const char *names[12] = {
+        "wpoll_a", "wintr_a", "wpoll_v", "wintr_v", "wpoll_v2", "wintr_v2",
+        "rpoll_a", "rintr_a", "rpoll_v", "rintr_v", "rpoll_v2", "rintr_v2",
+    };
+    int i;
+
+    g_peer_count = 0;
+    for (i = 0; i < 12; i++) {
+        char full[256];
+        int fd_r, fd_w;
+        snprintf(full, sizeof(full), "%s/%s", dir, names[i]);
+        fd_r = open(full, O_RDONLY | O_NONBLOCK);
+        fd_w = open(full, O_WRONLY | O_NONBLOCK);
+        g_peer_fds[g_peer_count++] = fd_r;
+        g_peer_fds[g_peer_count++] = fd_w;
+    }
+}
+
 struct open_thread_args {
     const char *dir;
 };
@@ -351,28 +383,20 @@ int main(void)
      * известная начальная точка для гонки (не неинициализированная
      * память). */
     {
-        pthread_t opener5, t_open, t_close;
+        pthread_t t_open, t_close;
         struct open_race_args ora;
 
-        /* НАЙДЕНО (реальное зависание, не гипотетически — поймано
-         * watchdog'ом в CI): нельзя join'ить opener5 ДО старта open() —
-         * peer_opener_thread() открывает только ОДНУ сторону каждого из
-         * 12 FIFO (`open_peers()`), блокируясь в ожидании, что именно
-         * nova_rpc_transport_open() откроет ВТОРУЮ сторону — это
-         * РЕНДЕЗВУ двух конкурентных блокирующих open(), как и во ВСЕХ
-         * остальных сценариях этого файла (см. сценарий 1 выше). Если
-         * join'ить opener5 первым (как было здесь по ошибке), он висит
-         * навечно — никто не открывает вторую сторону. Исправлено:
-         * opener5 запускается КОНКУРЕНТНО с open_race_fn, join — после
-         * обоих. */
-        pthread_create(&opener5, NULL, peer_opener_thread, &oa);
+        /* Готовим ОБА конца каждого FIFO заранее, синхронно (см.
+         * комментарий у open_peers_nonblocking_both_ends выше) — гонка
+         * ниже больше не зависит от тайминга рандеву с отдельным
+         * потоком-пиром, только от самого g_close_guard. */
+        open_peers_nonblocking_both_ends(oa.dir);
 
         ora.t = &t; ora.rc = -999;
         pthread_create(&t_open, NULL, open_race_fn, &ora);
         pthread_create(&t_close, NULL, closer_fn, &t); /* t уже CLOSED —
                                                          * close() на уже
                                                          * закрытом идемпотентен */
-        pthread_join(opener5, NULL);
         pthread_join(t_open, NULL);
         pthread_join(t_close, NULL);
 
