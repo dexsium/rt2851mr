@@ -304,7 +304,14 @@ int main(void)
 
         CHECK("создание повреждённого тестового файла", f != NULL);
         if (f) {
-            fwrite("not a real video file, just garbage bytes 0123456789", 1, 54, f);
+            {
+                /* НАЙДЕНО (ASan global-buffer-overflow): раньше здесь был
+                 * ошибочно посчитанный фиксированный размер (54) больше
+                 * реальной длины строкового литерала — читали 1 байт за
+                 * его пределами. strlen() исключает этот класс ошибок. */
+                const char *garbage = "not a real video file, just garbage bytes 0123456789";
+                fwrite(garbage, 1, strlen(garbage), f);
+            }
             fclose(f);
         }
 
