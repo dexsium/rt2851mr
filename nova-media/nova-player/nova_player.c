@@ -33,6 +33,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -202,14 +203,24 @@ nova_player_t *nova_player_create(void)
     nova_player_t *p;
     GError *err = NULL;
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: enter\n"); fflush(stderr);
+#endif
+
     pthread_mutex_lock(&g_init_mutex);
     if (!g_gst_initialized) {
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+        fprintf(stderr, "[trace] nova_player_create: calling gst_init_check\n"); fflush(stderr);
+#endif
         if (!gst_init_check(NULL, NULL, &err)) {
             pthread_mutex_unlock(&g_init_mutex);
             if (err) g_error_free(err);
             return NULL;
         }
         g_gst_initialized = 1;
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+        fprintf(stderr, "[trace] nova_player_create: gst_init_check done\n"); fflush(stderr);
+#endif
     }
     pthread_mutex_unlock(&g_init_mutex);
 
@@ -217,7 +228,13 @@ nova_player_t *nova_player_create(void)
     if (!p)
         return NULL;
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: calling gst_element_factory_make(playbin)\n"); fflush(stderr);
+#endif
     p->playbin = gst_element_factory_make("playbin", "nova-playbin");
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: playbin=%p\n", (void *)p->playbin); fflush(stderr);
+#endif
     if (!p->playbin) {
         free(p);
         return NULL;
@@ -235,6 +252,9 @@ nova_player_t *nova_player_create(void)
     p->state = NOVA_PLAYER_IDLE;
     atomic_store(&p->shutting_down, 0);
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_create: spawning bus thread\n"); fflush(stderr);
+#endif
     if (pthread_create(&p->bus_thread, NULL, bus_thread_fn, p) != 0) {
         g_source_destroy(p->bus_source);
         g_source_unref(p->bus_source);
@@ -391,11 +411,20 @@ void nova_player_destroy(nova_player_t *p)
      * даёт join() ниже, это только снижает задержку между quit() и join(). */
     atomic_store(&p->shutting_down, 1);
 
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+    fprintf(stderr, "[trace] nova_player_destroy: set_state(NULL)\n"); fflush(stderr);
+#endif
     gst_element_set_state(p->playbin, GST_STATE_NULL);
 
     if (p->bus_thread_started) {
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+        fprintf(stderr, "[trace] nova_player_destroy: quit+join\n"); fflush(stderr);
+#endif
         g_main_loop_quit(p->loop);
         pthread_join(p->bus_thread, NULL);
+#ifdef NOVA_PLAYER_DEBUG_TRACE
+        fprintf(stderr, "[trace] nova_player_destroy: joined\n"); fflush(stderr);
+#endif
     }
 
     g_source_destroy(p->bus_source);
