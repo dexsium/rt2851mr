@@ -201,6 +201,8 @@ jobs:
             gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
             pkg-config
+      - name: Warm up GStreamer plugin registry cache (first scan can be slow)
+        run: gst-inspect-1.0 > /dev/null
       - name: Build and run nova-player tests (real GStreamer pipeline, software only)
         run: |
           cd nova-media
