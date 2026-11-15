@@ -1,6 +1,7 @@
 #include "nova_rpc_callbacks.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <string.h>
 
 void nova_rpc_callbacks_init(nova_rpc_callback_ctx_t *ctx)
@@ -54,6 +55,24 @@ void nova_rpc_callbacks_unregister(nova_rpc_callback_ctx_t *ctx, int handle)
      * прямо сейчас handler этой записи не завершится — иначе
      * стирание entries[handle] (в частности user_data) ПОКА handler
      * его использует — use-after-free. */
+    if (ctx->entries[handle].active && ctx->entries[handle].busy &&
+        pthread_equal(ctx->entries[handle].busy_thread, pthread_self())) {
+        /* НАЙДЕННЫЙ реальный deadlock (ТЗ "Complete Closure" §4.1,
+         * "callback self-unregister"): этот unregister() вызван ИЗ
+         * handler этой же записи, в ЭТОМ ЖЕ потоке — busy не может
+         * стать 0, пока мы не вернёмся из handler, а мы заблокированы
+         * прямо здесь. Поэтому для self-unregister НЕ ждём: просто
+         * помечаем запись неактивной сразу — dispatch() сам корректно
+         * завершит учёт busy/broadcast после возврата из handler (см.
+         * .c/dispatch, он работает с локальной копией handler/user_data,
+         * не с самой записью). Полная очистка записи (memset) происходит
+         * только в ветке "чужой поток ждёт" ниже — здесь её делать
+         * нельзя: busy ещё не декрементирован, dispatch() обратится
+         * к entries[match].busy после возврата. */
+        ctx->entries[handle].active = 0;
+        pthread_mutex_unlock(&ctx->mutex);
+        return;
+    }
     while (ctx->entries[handle].active && ctx->entries[handle].busy)
         pthread_cond_wait(&ctx->busy_cond, &ctx->mutex);
     memset(&ctx->entries[handle], 0, sizeof(ctx->entries[handle]));
@@ -87,6 +106,13 @@ int nova_rpc_callbacks_dispatch(nova_rpc_callback_ctx_t *ctx,
             handler = ctx->entries[i].handler;
             user_data = ctx->entries[i].user_data;
             ctx->entries[i].busy++;
+            /* Запоминаем, КАКОЙ поток выполняет handler этой записи —
+             * нужно unregister()'у, чтобы отличить self-unregister (не
+             * ждать, см. .h/unregister) от удаления чужим потоком (ждать
+             * как раньше). Безопасно перезаписывать при рекурсивном
+             * повторном dispatch той же записи тем же потоком — значение
+             * не изменится. */
+            ctx->entries[i].busy_thread = pthread_self();
             match = i;
             break;
         }
